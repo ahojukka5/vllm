@@ -6719,8 +6719,15 @@ class GPUModelRunner(
                     profile_descs = descs[:2]
                     mem_samples: list[int] = []
 
+                    # torch.accelerator.get_memory_info only exists in newer
+                    # torch; fall back to CUDA mem_get_info (free VRAM bytes).
+                    def _free_vram() -> int:
+                        if hasattr(torch.accelerator, "get_memory_info"):
+                            return torch.accelerator.get_memory_info()[0]
+                        return torch.cuda.mem_get_info()[0]
+
                     for i, desc in enumerate(profile_descs):
-                        mem_before = torch.accelerator.get_memory_info()[0]
+                        mem_before = _free_vram()
                         self._warmup_and_capture(
                             desc,
                             cudagraph_runtime_mode=mode,
@@ -6734,7 +6741,7 @@ class GPUModelRunner(
                             ),
                         )
                         torch.accelerator.synchronize()
-                        free_after = torch.accelerator.get_memory_info()[0]
+                        free_after = _free_vram()
                         mem_samples.append(mem_before - free_after)
 
                     first_capture = mem_samples[0]

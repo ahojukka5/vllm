@@ -56,6 +56,14 @@ try:
 except ImportError as e:
     logger.warning("Failed to import from vllm._rocm_C with %r", e)
 
+# torch.accelerator.get_memory_info is newer-torch API; shim it to the CUDA
+# equivalent so cudagraph memory profiling (and any future call sites) work
+# on this ROCm/PyTorch build. Mirrors the xpu.py shim.
+if not hasattr(torch.accelerator, "get_memory_info"):
+    torch.accelerator.get_memory_info = (  # type: ignore[attr-defined]
+        lambda device=None: torch.cuda.mem_get_info(device)
+    )
+
 # Models not supported by ROCm.
 _ROCM_UNSUPPORTED_MODELS: list[str] = []
 
