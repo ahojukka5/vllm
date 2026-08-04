@@ -148,6 +148,58 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         else:
             raise NotImplementedError(f"Unsupported ocp_mx_scheme={self.ocp_mx_scheme}")
 
+    @staticmethod
+    def _touched_local_experts(
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        num_local_experts: int,
+    ) -> list[int] | None:
+        """Return the sorted list of local expert ids that receive at least
+        one token this step, or None when all experts are touched (or the
+        set cannot be determined without risking correctness).
+
+        Costs one small D2H sync per call; skip entirely under cudagraph
+        capture (syncs are capture-illegal) and fall back to dequantizing
+        everything.
+        """
+        if expert_map is None:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        local = expert_map[topk_ids.long()]
+        valid = local >= 0
+        if not bool(valid.any()):
+            return None
+        touched = torch.unique(local[valid]).cpu().tolist()
+        if len(touched) >= num_local_experts:
+            return None
+        return touched
+
+    def _dequantize_selected(
+        self,
+        w: torch.Tensor,
+        w_scale: torch.Tensor,
+        dtype: torch.dtype,
+        touched: list[int] | None,
+    ) -> torch.Tensor:
+        """Dequantize weights; when `touched` is a subset, only those expert
+        slices are materialized. The grouped GEMM launches tiles only for
+        experts present in `expert_ids`, so untouched slices are never read.
+        """
+        if touched is None:
+            return self._dequantize_weights(w, w_scale, dtype)
+        # MXFP4 packing: last dim holds 2 nibbles per byte -> dequant doubles it.
+        out = torch.empty(
+            (w.shape[0], w.shape[1], w.shape[2] * 2),
+            device=w.device,
+            dtype=dtype,
+        )
+        for e in touched:
+            out[e:e + 1] = self._dequantize_weights(
+                w[e:e + 1], w_scale[e:e + 1], dtype
+            )
+        return out
+
     def apply(
         self,
         output: torch.Tensor,
@@ -175,12 +227,17 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
 
+        # At low batch sizes each step routes to only a few of the local
+        # experts (topk=16 of 896 global; ~3 of 14 local at BS=1), so
+        # dequantizing every expert every step wastes ~5x the bandwidth.
+        touched = self._touched_local_experts(topk_ids, expert_map, w1.shape[0])
+
         # Dequantize w1 and w2 from packed OCP MX format to bf16/fp16
-        w1_dequant = self._dequantize_weights(
-            w1, self.w1_scale_val, hidden_states.dtype
+        w1_dequant = self._dequantize_selected(
+            w1, self.w1_scale_val, hidden_states.dtype, touched
         )
-        w2_dequant = self._dequantize_weights(
-            w2, self.w2_scale_val, hidden_states.dtype
+        w2_dequant = self._dequantize_selected(
+            w2, self.w2_scale_val, hidden_states.dtype, touched
         )
 
         # Activation quantization/dequantization is deferred to
