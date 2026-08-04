@@ -1878,6 +1878,23 @@ def fused_experts_impl(
         B_bias=w2_bias,
     )
 
+    if expert_map is not None:
+        # Zero (token, k) slots whose expert lives on another EP rank.
+        # The gemm2 kernel only writes rows for locally-owned experts and
+        # intermediate_cache3 is a reused-workspace view (aliases the gemm1
+        # region), so its unwritten rows hold stale activations. The 2-arg
+        # moe_sum below has no expert_map to mask them; without this they are
+        # summed into every token's output under DP+EP (confident-but-wrong
+        # logits, benchcg25/27).
+        ids = topk_ids.to(torch.long)
+        local_rows = (ids >= 0) & (ids < global_num_experts)
+        local_rows &= (
+            expert_map[ids.clamp(min=0, max=global_num_experts - 1)] >= 0
+        )
+        intermediate_cache3.mul_(
+            local_rows.unsqueeze(-1).to(intermediate_cache3.dtype)
+        )
+
     ops.moe_sum(
         intermediate_cache3.view(*intermediate_cache3.size()),
         out_hidden_states,
