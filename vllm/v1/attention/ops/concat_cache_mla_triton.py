@@ -21,6 +21,10 @@ def _concat_cache_mla_kernel(
     cache_ptr,
     slot_ptr,
     block_size,
+    stride_kvc_t,
+    stride_kpe_t,
+    stride_cache_b,
+    stride_cache_e,
     LORA: tl.constexpr,
     PE: tl.constexpr,
     BLOCK_LORA: tl.constexpr,
@@ -32,16 +36,18 @@ def _concat_cache_mla_kernel(
         return
     blk = slot // block_size
     off = slot % block_size
-    entry = (blk * block_size + off) * (LORA + PE)
+    # int64: blk derives from the int64 slot value, and cache entry
+    # offsets exceed int32 for large 256k-context pools.
+    entry = blk * stride_cache_b + off * stride_cache_e
 
     cols = tl.arange(0, BLOCK_LORA)
     lmask = cols < LORA
-    v = tl.load(kv_c_ptr + t * LORA + cols, mask=lmask)
+    v = tl.load(kv_c_ptr + t * stride_kvc_t + cols, mask=lmask)
     tl.store(cache_ptr + entry + cols, v, mask=lmask)
 
     pcols = tl.arange(0, BLOCK_PE)
     pmask = pcols < PE
-    p = tl.load(k_pe_ptr + t * PE + pcols, mask=pmask)
+    p = tl.load(k_pe_ptr + t * stride_kpe_t + pcols, mask=pmask)
     tl.store(cache_ptr + entry + LORA + pcols, p, mask=pmask)
 
 
@@ -56,8 +62,10 @@ def concat_and_cache_mla_triton(
     pe_dim = k_pe.size(1)
     block_size = kv_cache.size(1)
     assert kv_cache.size(2) == kv_lora_rank + pe_dim
+    # Innermost-contiguous is enough; cudagraph dummy runs hand us
+    # column-sliced views (unit stride but non-contiguous row stride).
     assert kv_c.stride(-1) == 1 and k_pe.stride(-1) == 1
-    assert kv_cache.is_contiguous()
+    assert kv_cache.stride(-1) == 1
     assert kv_c.dtype == kv_cache.dtype and k_pe.dtype == kv_cache.dtype
 
     grid = (num_tokens,)
@@ -67,6 +75,10 @@ def concat_and_cache_mla_triton(
         kv_cache,
         slot_mapping,
         block_size,
+        kv_c.stride(0),
+        k_pe.stride(0),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
         LORA=kv_lora_rank,
         PE=pe_dim,
         BLOCK_LORA=triton.next_power_of_2(kv_lora_rank),

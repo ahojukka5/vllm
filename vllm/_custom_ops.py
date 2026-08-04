@@ -2901,9 +2901,16 @@ def concat_and_cache_mla(
             f"kv_cache={tuple(kv_cache.shape)}"
         )
 
-    if kv_cache.is_contiguous() and kv_c.is_contiguous() and k_pe.is_contiguous():
+    if (
+        kv_cache.stride(-1) == 1
+        and kv_c.stride(-1) == 1
+        and k_pe.stride(-1) == 1
+        and kv_cache.dim() == 3
+    ):
         # Single-launch Triton path: no torch.nonzero (hidden GPU sync,
         # capture-illegal), ~6 fewer launches per MLA layer per step.
+        # Strided variant handles the column-sliced views handed out
+        # during cudagraph dummy runs.
         from vllm.v1.attention.ops.concat_cache_mla_triton import (
             concat_and_cache_mla_triton,
         )
