@@ -10,8 +10,9 @@ from torch.nn.parameter import Parameter
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
-from vllm.distributed import divide, get_tensor_model_parallel_rank
+from vllm.distributed import divide, get_dp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.model_loader.weight_utils import (
@@ -41,6 +42,93 @@ from ..ops.gather_initial_states import gather_initial_states
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
+
+import os as _debug_os  # noqa: E402
+
+logger = init_logger(__name__)
+_KDA_ATTN_DEBUG = _debug_os.environ.get("KDA_DEBUG_STATS") == "1"
+
+
+_debug_tensor_call_counts: dict[str, int] = {}
+_debug_log_once_seen: set[str] = set()
+
+
+def _debug_dp_rank() -> int:
+    try:
+        return get_dp_group().rank_in_group
+    except Exception:
+        return -1
+
+
+def _debug_log_once(tag: str, message: str) -> None:
+    """Cheap, allocation-free debug log: TP rank 0 of every DP replica, once
+    per (tag, dp_rank)."""
+    if not _KDA_ATTN_DEBUG:
+        return
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    dp_rank = _debug_dp_rank()
+    key = (tag, dp_rank)
+    if key in _debug_log_once_seen:
+        return
+    _debug_log_once_seen.add(key)
+    logger.warning("KDA_ATTN_DEBUG dp=%d %s: %s", dp_rank, tag, message)
+
+
+def _debug_tensor_stats(tag: str, x: torch.Tensor, max_calls: int = 1) -> None:
+    if not _KDA_ATTN_DEBUG:
+        return
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    dp_rank = _debug_dp_rank()
+    key = (tag, dp_rank)
+    count = _debug_tensor_call_counts.get(key, 0)
+    if count >= max_calls:
+        return
+    _debug_tensor_call_counts[key] = count + 1
+    xf = x.detach().float()
+    nan_count = torch.isnan(xf).sum().item()
+    inf_count = torch.isinf(xf).sum().item()
+    finite = xf[torch.isfinite(xf)]
+    if finite.numel() == 0:
+        logger.warning(
+            "KDA_ATTN_DEBUG dp=%d %s call=%d shape=%s ALL NON-FINITE nan=%d inf=%d",
+            dp_rank, tag, count, tuple(x.shape), nan_count, inf_count,
+        )
+        return
+    logger.warning(
+        "KDA_ATTN_DEBUG dp=%d %s call=%d shape=%s dtype=%s mean=%.6f std=%.6f min=%.6f "
+        "max=%.6f absmax=%.6f nan=%d inf=%d",
+        dp_rank, tag, count, tuple(x.shape), x.dtype,
+        finite.mean().item(), finite.std().item(),
+        finite.min().item(), finite.max().item(),
+        finite.abs().max().item(), nan_count, inf_count,
+    )
+
+
+def _debug_log_gate_params(module: "KimiGatedDeltaNetAttention") -> None:
+    if not _KDA_ATTN_DEBUG:
+        return
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    dp_rank = _debug_dp_rank()
+    if getattr(module, "_debug_gate_printed_dp", None) == dp_rank:
+        return
+    module._debug_gate_printed_dp = dp_rank
+    a = module.A_log.detach().float()
+    db = module.dt_bias.detach().float()
+    logger.warning(
+        "KDA_ATTN_DEBUG dp=%d prefix=%s A_log shape=%s min=%.4f max=%.4f mean=%.4f "
+        "nan=%d inf=%d | dt_bias shape=%s min=%.4f max=%.4f mean=%.4f nan=%d inf=%d "
+        "| num_heads=%d local_num_heads=%d head_dim=%d gate_lower_bound=%s",
+        dp_rank, getattr(module, "_debug_prefix", "?"),
+        tuple(a.shape), a.min().item(), a.max().item(), a.mean().item(),
+        torch.isnan(a).sum().item(), torch.isinf(a).sum().item(),
+        tuple(db.shape), db.min().item(), db.max().item(), db.mean().item(),
+        torch.isnan(db).sum().item(), torch.isinf(db).sum().item(),
+        module.num_heads, module.local_num_heads, module.head_dim,
+        module.gate_lower_bound,
+    )
 
 
 def a_log_weight_loader(
@@ -180,6 +268,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         prefix: str = "",
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        self._debug_prefix = prefix
+        self._debug_gate_printed = False
 
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
         assert kda_config is not None, "linear_attn_config must be set"
@@ -330,6 +420,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        _debug_log_gate_params(self)
         num_tokens = hidden_states.size(0)
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
         if self.use_full_rank_gate:
@@ -360,7 +451,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
-        core_attn_out = torch.empty(
+        # Zero-filled, not torch.empty: when _forward() early-returns on an
+        # idle/dummy batch (attn_metadata is None), this buffer is never
+        # written and still gets projected through o_proj below. With EP +
+        # an all-gather-based all2all backend, an idle rank's uninitialized
+        # (potentially NaN/Inf) activations get combined with the active
+        # rank's real tokens in the same collective buffer.
+        core_attn_out = torch.zeros(
             (1, num_tokens, self.local_num_heads, self.head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -387,6 +484,19 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
+
+        if _KDA_ATTN_DEBUG and self.layer_idx == 2:
+            self._debug_call_idx = _debug_tensor_call_counts.get(
+                "L002_forward_entry_calls", 0
+            )
+            _debug_tensor_call_counts["L002_forward_entry_calls"] = (
+                self._debug_call_idx + 1
+            )
+            _debug_log_once(
+                f"L002_forward_entered_call{self._debug_call_idx}",
+                f"attn_metadata_raw is None: {attn_metadata_raw is None}, "
+                f"mixed_qkv.shape={tuple(mixed_qkv.shape)}",
+            )
 
         if attn_metadata_raw is None:
             return
@@ -578,6 +688,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     use_qk_l2norm_in_kernel=True,
                     cu_seqlens=non_spec_query_start_loc,
                 )
+                if _KDA_ATTN_DEBUG and self.layer_idx == 2:
+                    ci = getattr(self, "_debug_call_idx", -1)
+                    _debug_log_once(
+                        f"L002_chunk_kda_called_call{ci}",
+                        f"q_ns.shape={tuple(q_ns.shape)} initial_state.shape={tuple(initial_state.shape)} "
+                        f"lower_bound={self.gate_lower_bound}",
+                    )
+                    _debug_tensor_stats(
+                        f"L002_core_attn_out_non_spec_raw_call{ci}", core_attn_out_non_spec
+                    )
                 # Init cache
                 recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
 
@@ -632,4 +752,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             ]
         else:
             assert core_attn_out_spec is not None
+        if _KDA_ATTN_DEBUG and self.layer_idx == 2:
+            ci = getattr(self, "_debug_call_idx", -1)
+            _debug_tensor_stats(f"L002_g2_output_gate_call{ci}", g2)
+            _debug_tensor_stats(f"L002_core_attn_out_pre_onorm_call{ci}", core_attn_out)
         core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+        if _KDA_ATTN_DEBUG and self.layer_idx == 2:
+            _debug_tensor_stats(f"L002_core_attn_out_post_onorm_call{ci}", core_attn_out)

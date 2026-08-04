@@ -1180,7 +1180,9 @@ if _is_cpu():
 if _build_custom_ops():
     if _is_hip():
         ext_modules.append(CMakeExtension(name="vllm._C"))
-    if _is_cuda() or _is_hip():
+    # LUMI ROCm 6.4 PyTorch does not provide the stable C++ ABI headers.
+    # Keep these optional compatibility extensions for CUDA builds only.
+    if _is_cuda():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
         ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
 
