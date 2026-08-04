@@ -25,7 +25,10 @@ def _situ_and_mul_kernel(
     D: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # int64 row index: with all-gather EP the token count M can reach
+    # 32k+, and row*2*D overflows int32 (M*TOP_K*2*D > 2**31), producing
+    # wrapped negative offsets and memory access faults.
+    row = tl.program_id(0).to(tl.int64)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     cmask = col < D
 

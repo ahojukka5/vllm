@@ -47,7 +47,7 @@ def _rms_norm_kernel(
     N: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < N
     x = tl.load(x_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
@@ -71,7 +71,7 @@ def _fused_add_rms_norm_kernel(
     BLOCK: tl.constexpr,
 ):
     # In-place: y aliases x, res_ptr holds the residual in and out.
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < N
     x = tl.load(x_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
