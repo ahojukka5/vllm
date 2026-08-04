@@ -116,7 +116,13 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import (
+        on_gfx1x,
+        on_gfx9,
+        on_gfx90a,
+        on_gfx950,
+        on_gfx1250,
+    )
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -170,6 +176,11 @@ def rocm_unquantized_gemm_impl(
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
         and (on_gfx9() or on_gfx1x())
+        # ops.wvSplitK produces wholesale garbage on gfx90a (MI250X):
+        # rel_err ~0.99 vs F.linear for every tested shape, incl. the
+        # lm_head GEMV, which turned logits into near-uniform noise.
+        # Never dispatch skinny GEMV kernels on this arch.
+        and not on_gfx90a()
         # build (gfx9/gfx11 ISA); fall back to torch GEMM there.
         # TODO GFX1250: Include once skinny GEMM is supported on gfx1250
         and x.dtype in [torch.float16, torch.bfloat16]
