@@ -20,6 +20,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.experts.mxfp4_masked_dequant import (
+    moe_touched_expert_mask,
+    mxfp4_dequant_masked,
+)
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import dequant_mxfp6
@@ -230,15 +234,32 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         # At low batch sizes each step routes to only a few of the local
         # experts (topk=16 of 896 global; ~3 of 14 local at BS=1), so
         # dequantizing every expert every step wastes ~5x the bandwidth.
-        touched = self._touched_local_experts(topk_ids, expert_map, w1.shape[0])
+        if (
+            expert_map is not None
+            and self.ocp_mx_scheme == OCP_MX_Scheme.w_mxfp4
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # Cudagraph-capture path: a D2H sync is capture-illegal, so use
+            # the mask-inside-kernel variant with a GPU-resident mask.
+            mask = moe_touched_expert_mask(topk_ids, expert_map, w1.shape[0])
+            w1_dequant = mxfp4_dequant_masked(
+                w1, self.w1_scale_val, mask, hidden_states.dtype
+            )
+            w2_dequant = mxfp4_dequant_masked(
+                w2, self.w2_scale_val, mask, hidden_states.dtype
+            )
+        else:
+            touched = self._touched_local_experts(
+                topk_ids, expert_map, w1.shape[0]
+            )
 
-        # Dequantize w1 and w2 from packed OCP MX format to bf16/fp16
-        w1_dequant = self._dequantize_selected(
-            w1, self.w1_scale_val, hidden_states.dtype, touched
-        )
-        w2_dequant = self._dequantize_selected(
-            w2, self.w2_scale_val, hidden_states.dtype, touched
-        )
+            # Dequantize w1 and w2 from packed OCP MX format to bf16/fp16
+            w1_dequant = self._dequantize_selected(
+                w1, self.w1_scale_val, hidden_states.dtype, touched
+            )
+            w2_dequant = self._dequantize_selected(
+                w2, self.w2_scale_val, hidden_states.dtype, touched
+            )
 
         # Activation quantization/dequantization is deferred to
         # `moe_kernel_quantize_input` in TritonExperts.apply.
