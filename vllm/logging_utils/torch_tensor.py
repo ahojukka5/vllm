@@ -4,7 +4,22 @@ from typing import Any
 
 
 def tensors_str_no_data(arg: Any):
-    from torch._tensor_str import printoptions
+    # Metadata-only formatting: str(tensor) — even with
+    # printoptions(threshold=1) — calls torch.masked_select while
+    # summarizing values, which is illegal during CUDA graph capture
+    # (hipErrorStreamCaptureUnsupported). IR-op debug logging evaluates
+    # this lazily inside captured regions, so it must never read tensor
+    # data. Shapes/dtypes/devices are sufficient for op tracing.
+    import torch
 
-    with printoptions(threshold=1, edgeitems=0):
-        return str(arg)
+    def _fmt(a):
+        if isinstance(a, torch.Tensor):
+            return (f"Tensor(shape={tuple(a.shape)}, dtype={a.dtype}, "
+                    f"device={a.device})")
+        if isinstance(a, (list, tuple)):
+            return type(a)(_fmt(x) for x in a)
+        if isinstance(a, dict):
+            return {k: _fmt(v) for k, v in a.items()}
+        return a
+
+    return str(_fmt(arg))
