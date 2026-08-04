@@ -2225,13 +2225,86 @@ def wvSplitKQ(
 
 
 # moe
+# LUMI_ROCM_NATIVE_MOE_HELPERS
+# PyTorch ROCm 2.9 does not provide the stable C++ ABI headers required by
+# vLLM's optional _moe_C_stable_libtorch extension. Keep compiled helpers when
+# they exist and provide device-tensor fallbacks for the Kimi K3 Triton MoE
+# path otherwise.
+def _has_moe_op(name: str) -> bool:
+    return hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, name)
+
+
+def _native_moe_align_block_size(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    experts_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    expert_map: torch.Tensor | None,
+) -> None:
+    flat_experts = topk_ids.reshape(-1).to(torch.long)
+    token_ids = torch.arange(
+        flat_experts.numel(), device=topk_ids.device, dtype=torch.long
+    )
+
+    valid = (flat_experts >= 0) & (flat_experts < num_experts)
+    flat_experts = flat_experts[valid]
+    token_ids = token_ids[valid]
+
+    if expert_map is not None:
+        mapped_experts = expert_map[flat_experts].to(torch.long)
+        local = mapped_experts >= 0
+        flat_experts = mapped_experts[local]
+        token_ids = token_ids[local]
+
+    counts = torch.bincount(flat_experts, minlength=num_experts)
+    padded_counts = ((counts + block_size - 1) // block_size) * block_size
+    expert_starts = torch.cumsum(counts, dim=0) - counts
+    padded_starts = torch.cumsum(padded_counts, dim=0) - padded_counts
+
+    order = torch.argsort(flat_experts)
+    ordered_experts = flat_experts[order]
+    positions = torch.arange(order.numel(), device=topk_ids.device)
+    destinations = (
+        padded_starts[ordered_experts]
+        + positions
+        - expert_starts[ordered_experts]
+    )
+
+    sorted_token_ids.fill_(topk_ids.numel())
+    sorted_token_ids[destinations] = token_ids[order].to(sorted_token_ids.dtype)
+
+    blocks_per_expert = padded_counts // block_size
+    block_experts = torch.repeat_interleave(
+        torch.arange(num_experts, device=topk_ids.device, dtype=torch.int32),
+        blocks_per_expert,
+    )
+    experts_ids.fill_(-1)
+    experts_ids[: block_experts.numel()].copy_(block_experts)
+    num_tokens_post_pad.copy_(
+        padded_counts.sum().reshape(1).to(num_tokens_post_pad.dtype)
+    )
+
+
 def moe_sum(
     input: torch.Tensor,
     output: torch.Tensor,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
 ):
-    torch.ops._moe_C.moe_sum(input, output, topk_ids, expert_map)
+    if _has_moe_op("moe_sum"):
+        torch.ops._moe_C.moe_sum(input, output, topk_ids, expert_map)
+        return
+
+    logger.warning_once(
+        "[ROCm] _moe_C.moe_sum is unavailable; using torch.sum fallback."
+    )
+    values = input
+    if topk_ids is not None and expert_map is not None:
+        mapped = expert_map[topk_ids.to(torch.long)]
+        values = values * (mapped >= 0).unsqueeze(-1).to(values.dtype)
+    output.copy_(values.sum(dim=1))
 
 
 def moe_align_block_size(
@@ -2243,7 +2316,23 @@ def moe_align_block_size(
     num_tokens_post_pad: torch.Tensor,
     expert_map: torch.Tensor | None = None,
 ) -> None:
-    torch.ops._moe_C.moe_align_block_size(
+    if _has_moe_op("moe_align_block_size"):
+        torch.ops._moe_C.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_token_ids,
+            experts_ids,
+            num_tokens_post_pad,
+            expert_map,
+        )
+        return
+
+    logger.warning_once(
+        "[ROCm] _moe_C.moe_align_block_size is unavailable; using "
+        "device-tensor expert alignment fallback."
+    )
+    _native_moe_align_block_size(
         topk_ids,
         num_experts,
         block_size,
@@ -2761,9 +2850,70 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.concat_and_cache_mla(
-        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+    if hasattr(torch.ops._C_cache_ops, "concat_and_cache_mla"):
+        torch.ops._C_cache_ops.concat_and_cache_mla(
+            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+        )
+        return
+
+    if kv_cache_dtype != "auto":
+        raise RuntimeError(
+            "The PyTorch-native concat_and_cache_mla fallback only supports "
+            f"kv_cache_dtype='auto', got {kv_cache_dtype!r}"
+        )
+    if kv_c.dtype != k_pe.dtype or kv_cache.dtype != kv_c.dtype:
+        raise RuntimeError(
+            "The PyTorch-native concat_and_cache_mla fallback requires "
+            "matching source and cache dtypes"
+        )
+    if kv_c.dim() != 2 or k_pe.dim() != 2 or kv_cache.dim() != 3:
+        raise RuntimeError(
+            "Unexpected tensor ranks for concat_and_cache_mla fallback: "
+            f"kv_c={tuple(kv_c.shape)}, k_pe={tuple(k_pe.shape)}, "
+            f"kv_cache={tuple(kv_cache.shape)}"
+        )
+
+    if kv_cache.is_contiguous() and kv_c.is_contiguous() and k_pe.is_contiguous():
+        # Single-launch Triton path: no torch.nonzero (hidden GPU sync,
+        # capture-illegal), ~6 fewer launches per MLA layer per step.
+        from vllm.v1.attention.ops.concat_cache_mla_triton import (
+            concat_and_cache_mla_triton,
+        )
+        concat_and_cache_mla_triton(kv_c, k_pe, kv_cache, slot_mapping)
+        return
+
+    # V1 may pad kv_c and k_pe beyond the actual token count. The slot mapping
+    # contains only real tokens and uses negative slots for any remaining
+    # padding. Mirror the native kernel's slot-to-block layout exactly.
+    num_tokens = slot_mapping.numel()
+    kv_c = kv_c[:num_tokens]
+    k_pe = k_pe[:num_tokens]
+    source_indices = torch.nonzero(
+        slot_mapping >= 0, as_tuple=False
+    ).flatten()
+    valid_slots = slot_mapping.index_select(0, source_indices)
+    block_size = kv_cache.size(1)
+    block_indices = torch.div(
+        valid_slots, block_size, rounding_mode="floor"
     )
+    block_offsets = torch.remainder(valid_slots, block_size)
+
+    kv_lora_rank = kv_c.size(1)
+    pe_dim = k_pe.size(1)
+    if kv_cache.size(2) != kv_lora_rank + pe_dim:
+        raise RuntimeError(
+            "Unexpected MLA cache entry width: "
+            f"cache={kv_cache.size(2)}, kv_c={kv_lora_rank}, k_pe={pe_dim}"
+        )
+
+    kv_cache[
+        block_indices, block_offsets, :kv_lora_rank
+    ] = kv_c.index_select(0, source_indices)
+    kv_cache[
+        block_indices,
+        block_offsets,
+        kv_lora_rank : kv_lora_rank + pe_dim,
+    ] = k_pe.index_select(0, source_indices)
 
 
 def concat_and_cache_mla_grouped(
