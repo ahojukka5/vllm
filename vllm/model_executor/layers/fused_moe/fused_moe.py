@@ -109,6 +109,7 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    use_mxfp4_w4a16: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -188,7 +189,7 @@ def fused_moe_kernel_gptq_awq(
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    if use_int4_w4a16:
+    if use_int4_w4a16 or use_mxfp4_w4a16:
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
@@ -234,7 +235,7 @@ def fused_moe_kernel_gptq_awq(
             other=0.0,
         )
         b = tl.load(b_ptrs)
-        if use_int4_w4a16:
+        if use_int4_w4a16 or use_mxfp4_w4a16:
             b = (b >> b_shifter) & 0xF
 
         b_scale_ptrs = (
@@ -243,41 +244,62 @@ def fused_moe_kernel_gptq_awq(
             + offs_bn[None, :] * stride_bsn
             + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
         )
-        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        b_scale = b_scale.to(tl.float32)
 
-        if has_zp and use_int4_w4a16:
-            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
-            b_zp_ptrs = (
-                b_zp_ptr
-                + off_experts * stride_bze
-                + (offs_bn[None, :] // 2) * stride_bzn
-                + offs_k_true * stride_bzk
+        if use_mxfp4_w4a16:
+            # OCP MXFP4: e2m1 nibble values scaled by e8m0 (2**(scale-127))
+            # per 32-element group. No zero point.
+            b_scale_i = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+            factor = tl.exp2((b_scale_i.to(tl.int32) - 127).to(tl.float32))
+            sign = (b >> 3) & 1
+            exp = (b >> 1) & 0x3
+            mant = (b & 1).to(tl.float32)
+            mag = tl.where(
+                exp == 0,
+                0.5 * mant,
+                (1.0 + 0.5 * mant) * tl.exp2((exp - 1).to(tl.float32)),
             )
-            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
-            b_zp = (b_zp >> b_zp_shifter) & 0xF
-            b_zp = b_zp.to(tl.float32)
-        elif has_zp and use_int8_w8a16:
-            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
-            b_zp_ptrs = (
-                b_zp_ptr
-                + off_experts * stride_bze
-                + offs_bn[None, :] * stride_bzn
-                + offs_k_true * stride_bzk
-            )
-            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
-            b_zp = b_zp.to(tl.float32)
-
-        # We accumulate along the K dimension.
-        if has_zp:
-            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            fp4 = tl.where(sign == 1, -mag, mag)
+            b = (fp4 * factor).to(compute_type)
         else:
-            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+            b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+            b_scale = b_scale.to(tl.float32)
+
+            if has_zp and use_int4_w4a16:
+                offs_k_true = (
+                    (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+                )
+                b_zp_ptrs = (
+                    b_zp_ptr
+                    + off_experts * stride_bze
+                    + (offs_bn[None, :] // 2) * stride_bzn
+                    + offs_k_true * stride_bzk
+                )
+                b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+                b_zp = (b_zp >> b_zp_shifter) & 0xF
+                b_zp = b_zp.to(tl.float32)
+            elif has_zp and use_int8_w8a16:
+                offs_k_true = (
+                    (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+                )
+                b_zp_ptrs = (
+                    b_zp_ptr
+                    + off_experts * stride_bze
+                    + (offs_bn[None, :] // 2) * stride_bzn
+                    + offs_k_true * stride_bzk
+                )
+                b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+                b_zp = b_zp.to(tl.float32)
+
+            # We accumulate along the K dimension.
+            if has_zp:
+                b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            else:
+                b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
         accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        if use_int4_w4a16:
+        if use_int4_w4a16 or use_mxfp4_w4a16:
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -687,10 +709,14 @@ def invoke_fused_moe_wna16_triton_kernel(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
+    use_mxfp4_w4a16: bool = False,
 ):
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
     assert block_shape is not None and block_shape[0] == 0
+    if use_mxfp4_w4a16:
+        assert not (use_int4_w4a16 or use_int8_w8a16)
+        assert block_shape[1] == 32, "MXFP4 uses 32-element scale groups"
 
     M = A.size(0)
     num_tokens = M * top_k
@@ -756,6 +782,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
         **config,
     )
 

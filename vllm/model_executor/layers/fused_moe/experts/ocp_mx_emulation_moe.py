@@ -11,6 +11,8 @@ Weights are dequantized on the fly during each forward, we fall back to calling
 is applied on activations via `moe_kernel_quantize_input`.
 """
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -25,6 +27,14 @@ from vllm.model_executor.layers.fused_moe.experts.mxfp4_masked_dequant import (
     mxfp4_dequant_masked,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    _prepare_expert_assignment,
+    invoke_fused_moe_wna16_triton_kernel,
+    try_get_optimal_moe_config,
+)
+from vllm.model_executor.layers.fused_moe.utils import (
+    _resize_cache,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import dequant_mxfp6
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
@@ -35,6 +45,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_quark
+from vllm.triton_utils import tl
 
 logger = init_logger(__name__)
 
@@ -231,6 +242,25 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
 
+        if (
+            self.ocp_mx_scheme == OCP_MX_Scheme.w_mxfp4
+            and os.environ.get("VLLM_K3_MXFP4_PACKED_GEMM", "1") == "1"
+        ):
+            return self._apply_mxfp4_packed(
+                output=output,
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+
         # At low batch sizes each step routes to only a few of the local
         # experts (topk=16 of 896 global; ~3 of 14 local at BS=1), so
         # dequantizing every expert every step wastes ~5x the bandwidth.
@@ -280,3 +310,115 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             expert_tokens_meta=expert_tokens_meta,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
+
+    def _apply_mxfp4_packed(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        apply_router_weight_on_input: bool,
+    ):
+        """MXFP4-native MoE: grouped GEMM reads packed uint8 weights and
+        dequantizes e2m1/e8m0 in the kernel inner loop — no dequant
+        materialization at all. Mirrors TritonExperts.apply's GEMM
+        orchestration (weight-only scheme: activations stay in the
+        compute dtype). Cudagraph-safe: no host syncs anywhere."""
+        assert hidden_states.is_contiguous() and hidden_states.dim() == 2
+        assert w1.stride(-1) == 1 and w2.stride(-1) == 1
+
+        E, num_tokens, N, K, top_k_num = self.moe_problem_size(
+            hidden_states, w1, w2, topk_ids
+        )
+        if global_num_experts == -1:
+            global_num_experts = E
+
+        block_shape = [0, 32]
+        config = try_get_optimal_moe_config(
+            w1.size(),
+            w2.size(),
+            top_k_num,
+            self.quant_config.config_name(hidden_states.dtype),
+            num_tokens,
+            block_shape=block_shape,
+        )
+
+        if hidden_states.dtype == torch.bfloat16:
+            compute_type = tl.bfloat16
+        elif hidden_states.dtype == torch.float16:
+            compute_type = tl.float16
+        else:
+            raise ValueError(f"Unsupported dtype: {hidden_states.dtype}")
+
+        intermediate_cache1 = _resize_cache(workspace2, (num_tokens, top_k_num, N))
+        cache2_dim = self.adjust_N_for_activation(N, activation)
+        intermediate_cache2 = _resize_cache(
+            workspace13, (num_tokens * top_k_num, cache2_dim)
+        )
+        intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            _prepare_expert_assignment(
+                topk_ids,
+                config,
+                num_tokens,
+                top_k_num,
+                global_num_experts,
+                expert_map,
+                use_int4_w4a16=True,
+                block_shape=block_shape,
+            )
+        )
+
+        invoke_fused_moe_wna16_triton_kernel(
+            hidden_states,
+            w1,
+            intermediate_cache1,
+            self.w1_scale_val,
+            None,  # B_zp
+            None,  # topk_weights
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            False,  # mul_routed_weight
+            top_k_num,
+            config,
+            compute_type,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            block_shape=block_shape,
+            use_mxfp4_w4a16=True,
+        )
+
+        self.activation(
+            activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+        )
+
+        invoke_fused_moe_wna16_triton_kernel(
+            intermediate_cache2,
+            w2,
+            intermediate_cache3,
+            self.w2_scale_val,
+            None,  # B_zp
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            1,
+            config,
+            compute_type,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            block_shape=block_shape,
+            use_mxfp4_w4a16=True,
+        )
+
+        self.moe_sum(intermediate_cache3, output)
