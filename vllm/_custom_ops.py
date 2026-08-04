@@ -2243,47 +2243,62 @@ def _native_moe_align_block_size(
     num_tokens_post_pad: torch.Tensor,
     expert_map: torch.Tensor | None,
 ) -> None:
-    flat_experts = topk_ids.reshape(-1).to(torch.long)
-    token_ids = torch.arange(
-        flat_experts.numel(), device=topk_ids.device, dtype=torch.long
-    )
+    # Cudagraph-capture-safe implementation: every tensor has a static
+    # shape and no op synchronizes with the host (no torch.bincount, no
+    # boolean-mask indexing, no repeat_interleave). Invalid/expert-mapped
+    # entries are routed to a dump bin (index num_experts) whose padded
+    # region lands after num_tokens_post_pad, so the downstream kernel
+    # never reads it. Sorted-bin scatter destinations stay unique and
+    # in-bounds because the total padded size over all bins (including the
+    # dump bin) never exceeds the sorted_token_ids buffer: with
+    # max_num_tokens_padded = T + E*(bs-1) or its T*bs clamp, padded sum
+    # over nonempty bins <= T + nonempty_bins*(bs-1) <= buffer size.
+    device = topk_ids.device
+    flat = topk_ids.reshape(-1).to(torch.long)
+    num_flat = flat.numel()
+    token_ids = torch.arange(num_flat, device=device, dtype=torch.long)
 
-    valid = (flat_experts >= 0) & (flat_experts < num_experts)
-    flat_experts = flat_experts[valid]
-    token_ids = token_ids[valid]
-
+    valid = (flat >= 0) & (flat < num_experts)
     if expert_map is not None:
-        mapped_experts = expert_map[flat_experts].to(torch.long)
-        local = mapped_experts >= 0
-        flat_experts = mapped_experts[local]
-        token_ids = token_ids[local]
+        mapped = expert_map[flat.clamp(0, num_experts - 1)].to(torch.long)
+        valid &= mapped >= 0
+        flat = torch.where(valid, mapped, flat)
 
-    counts = torch.bincount(flat_experts, minlength=num_experts)
-    padded_counts = ((counts + block_size - 1) // block_size) * block_size
-    expert_starts = torch.cumsum(counts, dim=0) - counts
-    padded_starts = torch.cumsum(padded_counts, dim=0) - padded_counts
+    fe = torch.where(valid, flat, torch.full_like(flat, num_experts))
+    counts_full = torch.nn.functional.one_hot(fe, num_experts + 1).sum(dim=0)
+    counts_full = counts_full.to(torch.long)
+    padded_full = ((counts_full + block_size - 1) // block_size) * block_size
+    padded_starts_full = torch.cumsum(padded_full, dim=0) - padded_full
+    expert_starts_full = torch.cumsum(counts_full, dim=0) - counts_full
 
-    order = torch.argsort(flat_experts)
-    ordered_experts = flat_experts[order]
-    positions = torch.arange(order.numel(), device=topk_ids.device)
+    order = torch.argsort(fe, stable=True)
+    ordered_experts = fe[order]
+    positions = torch.arange(num_flat, device=device)
     destinations = (
-        padded_starts[ordered_experts]
+        padded_starts_full[ordered_experts]
         + positions
-        - expert_starts[ordered_experts]
+        - expert_starts_full[ordered_experts]
+    )
+    sorted_token_ids.fill_(num_flat)
+    sorted_token_ids.scatter_(
+        0, destinations, token_ids[order].to(sorted_token_ids.dtype)
     )
 
-    sorted_token_ids.fill_(topk_ids.numel())
-    sorted_token_ids[destinations] = token_ids[order].to(sorted_token_ids.dtype)
-
-    blocks_per_expert = padded_counts // block_size
-    block_experts = torch.repeat_interleave(
-        torch.arange(num_experts, device=topk_ids.device, dtype=torch.int32),
-        blocks_per_expert,
+    total_valid_padded = padded_starts_full[num_experts]
+    padded_cumsum = torch.cumsum(padded_full[:num_experts], dim=0)
+    block_idx = torch.arange(experts_ids.numel(), device=device)
+    block_expert = torch.searchsorted(
+        padded_cumsum, block_idx * block_size, right=True
     )
-    experts_ids.fill_(-1)
-    experts_ids[: block_experts.numel()].copy_(block_experts)
+    experts_ids.copy_(
+        torch.where(
+            block_idx * block_size < total_valid_padded,
+            block_expert.to(experts_ids.dtype),
+            torch.full_like(block_idx, -1, dtype=experts_ids.dtype),
+        )
+    )
     num_tokens_post_pad.copy_(
-        padded_counts.sum().reshape(1).to(num_tokens_post_pad.dtype)
+        total_valid_padded.reshape(1).to(num_tokens_post_pad.dtype)
     )
 
 
