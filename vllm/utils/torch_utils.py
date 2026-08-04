@@ -730,7 +730,14 @@ def weak_ref_tensor(tensor: Any) -> Any:
     This ignores 0-size tensors as those don't allocate any memory.
     """
     if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
-        return torch.ops._C.weak_ref_tensor(tensor)
+        if hasattr(torch.ops._C, "weak_ref_tensor"):
+            return torch.ops._C.weak_ref_tensor(tensor)
+        # Builds without the _C extension (this ROCm port): a detach()
+        # alias shares the storage and is functionally correct for
+        # cudagraph output bookkeeping; it pins the graph-pool block
+        # instead of letting the pool reclaim it (extra pool memory
+        # across captured graphs, no correctness impact).
+        return tensor.detach()
     else:
         return tensor
 
