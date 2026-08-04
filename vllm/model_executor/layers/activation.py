@@ -177,8 +177,32 @@ class SituAndMul(CustomOp):
         super().__init__(compile_native=compile_native)
         self.beta = float(beta)
         self.linear_beta = None if linear_beta is None else float(linear_beta)
-        if current_platform.is_cuda_alike():
+        if current_platform.is_rocm() and not hasattr(
+            torch.ops._C, "situ_and_mul"
+        ):
+            logger.warning_once(
+                "[ROCm] situ_and_mul custom op is unavailable; "
+                "using the fused Triton SituGLU implementation."
+            )
+            self._forward_method = self.forward_rocm_triton
+        elif current_platform.is_cuda_alike():
             self.op = torch.ops._C.situ_and_mul
+
+    def forward_rocm_triton(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm.model_executor.layers.fused_moe.situ_triton import (
+            situ_and_mul_triton,
+        )
+        d = x.shape[-1] // 2
+        out = torch.empty(
+            x.shape[:-1] + (d,), dtype=x.dtype, device=x.device
+        )
+        situ_and_mul_triton(
+            out,
+            x,
+            self.beta,
+            -1.0 if self.linear_beta is None else self.linear_beta,
+        )
+        return out
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
