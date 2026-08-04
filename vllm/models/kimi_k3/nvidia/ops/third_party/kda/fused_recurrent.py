@@ -21,7 +21,10 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
         "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
     }
 )
-@triton.jit
+# do_not_specialize=["T"]: same request-time recompile hazard as the
+# other KDA kernels (T is the sequence length); the fused_recurrent
+# kernels below already opt T out of specialization.
+@triton.jit(do_not_specialize=["T"])
 def _kda_gate_beta_fwd_kernel(
     raw_g,
     raw_beta,

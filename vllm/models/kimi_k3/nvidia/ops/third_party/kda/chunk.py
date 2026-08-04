@@ -823,7 +823,11 @@ def chunk_kda_with_fused_gate(
     ],
     key=["H", "D"],
 )
-@triton.jit
+# do_not_specialize=["T"]: T is the sequence length and changes per
+# request; specializing on it forces a request-time JIT recompile of this
+# gate kernel on every rank at the first non-div-16 length (benchcg16
+# hang). Sibling kernels in this file already do the same.
+@triton.jit(do_not_specialize=["T"])
 def kda_gate_fwd_kernel(
     g,
     A,
