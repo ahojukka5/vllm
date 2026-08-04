@@ -15,12 +15,15 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _situ_and_mul_kernel(
     out_ptr,
     in_ptr,
     beta,
     linear_beta,
+    # do_not_specialize (see decorator below): M tracks the token count,
+    # which changes at serving time; a fresh M bucket would force a
+    # request-time JIT recompile on every rank (benchcg16 hang).
     M,
     D: tl.constexpr,
     BLOCK: tl.constexpr,

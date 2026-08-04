@@ -61,7 +61,13 @@ def write_zeros_to_output(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-@triton.jit
+# do_not_specialize for EM/num_valid_tokens: both scale with the token
+# count, which changes at serving time (DP-gathered prefill batches,
+# mixed dummy+real decode batches). Without this, the first request at a
+# new M bucket triggers a request-time JIT recompile on all 64 ranks;
+# the compile skew across ranks then deadlocks against RCCL busy-spin
+# collectives and hipModuleLoad (benchcg16 hang, 2026-08-04).
+@triton.jit(do_not_specialize=["EM", "num_valid_tokens"])
 def fused_moe_kernel_gptq_awq(
     # Pointers to matrices
     a_ptr,
