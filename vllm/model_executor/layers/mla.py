@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 
 import torch
@@ -9,6 +10,93 @@ from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.platforms import current_platform
+
+_MLA_DEBUG_STATS = os.environ.get("KDA_DEBUG_STATS") == "1"
+_mla_debug_call_counts: dict[str, int] = {}
+
+
+def _mla_debug_stats(tag: str, x: torch.Tensor, max_calls: int = 40) -> None:
+    """Temporary diagnostic: log tensor stats for the Gated-MLA output-gate
+    investigation (docs/investigation.md). No-op unless KDA_DEBUG_STATS=1;
+    only ever called from layers that construct a g_proj (Kimi-K3 MLA), so
+    this is a no-op for every other model regardless of the env var."""
+    if not _MLA_DEBUG_STATS:
+        return
+    try:
+        from vllm.distributed import get_dp_group, get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        dp_rank = get_dp_group().rank_in_group
+    except Exception:
+        dp_rank = -1
+    count = _mla_debug_call_counts.get(tag, 0)
+    if count >= max_calls:
+        return
+    _mla_debug_call_counts[tag] = count + 1
+    from vllm.logger import init_logger
+
+    logger = init_logger(__name__)
+    xf = x.detach().float()
+    finite = xf[torch.isfinite(xf)]
+    if finite.numel() == 0:
+        logger.warning(
+            "MLA_GATE_DEBUG dp=%d %s call=%d shape=%s ALL NON-FINITE",
+            dp_rank, tag, count, tuple(x.shape),
+        )
+        return
+    logger.warning(
+        "MLA_GATE_DEBUG dp=%d %s call=%d shape=%s mean=%.6f std=%.6f min=%.6f "
+        "max=%.6f absmax=%.6f last_row_mean=%.6f last_row_absmax=%.6f",
+        dp_rank, tag, count, tuple(x.shape),
+        finite.mean().item(), finite.std().item(),
+        finite.min().item(), finite.max().item(), finite.abs().max().item(),
+        x[-1].detach().float().mean().item() if x.dim() >= 1 and x.shape[0] > 0 else -1.0,
+        x[-1].detach().float().abs().max().item() if x.dim() >= 1 and x.shape[0] > 0 else -1.0,
+    )
+
+
+def _mla_debug_argmax_row(
+    tag: str, pre_norm: torch.Tensor, post_norm: torch.Tensor, max_calls: int = 40
+) -> None:
+    """Temporary diagnostic: find the token row with the largest |post_norm|
+    value and report that row's pre-norm RMS (to test the hypothesis that
+    kv_a_layernorm blows up when its input has near-zero variance at a
+    specific prefill position) plus which row index it is."""
+    if not _MLA_DEBUG_STATS:
+        return
+    if post_norm.dim() < 2 or post_norm.shape[0] <= 1:
+        return
+    try:
+        from vllm.distributed import get_dp_group, get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        dp_rank = get_dp_group().rank_in_group
+    except Exception:
+        dp_rank = -1
+    count = _mla_debug_call_counts.get(tag, 0)
+    if count >= max_calls:
+        return
+    _mla_debug_call_counts[tag] = count + 1
+    from vllm.logger import init_logger
+
+    logger = init_logger(__name__)
+    post_f = post_norm.detach().float()
+    pre_f = pre_norm.detach().float()
+    row_absmax = post_f.abs().amax(dim=tuple(range(1, post_f.dim())))
+    row = int(torch.argmax(row_absmax).item())
+    pre_row = pre_f[row]
+    pre_row_rms = pre_row.pow(2).mean().sqrt().item()
+    pre_row_absmax = pre_row.abs().max().item()
+    post_row_absmax = row_absmax[row].item()
+    num_rows = post_f.shape[0]
+    logger.warning(
+        "MLA_GATE_DEBUG dp=%d %s call=%d ARGMAX row=%d/%d pre_norm_rms=%.8f "
+        "pre_norm_absmax=%.6f post_norm_absmax=%.6f",
+        dp_rank, tag, count, row, num_rows, pre_row_rms, pre_row_absmax,
+        post_row_absmax,
+    )
 
 
 @dataclass
@@ -188,6 +276,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
+        if self.g_proj is not None:
+            _mla_debug_argmax_row(f"{self.prefix}_kv_c_layernorm", kv_c, kv_c_normed)
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
@@ -212,6 +302,12 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.dcp_q_replicate:
             q_dcp_replicated, q = q, q_proj_layer._local_view(q)
 
+        if self.g_proj is not None:
+            _mla_debug_stats(f"{self.prefix}_hidden_states_in", hidden_states)
+            _mla_debug_stats(f"{self.prefix}_q_pre_attn", q)
+            _mla_debug_stats(f"{self.prefix}_kv_c_normed_pre_attn", kv_c_normed)
+            _mla_debug_stats(f"{self.prefix}_k_pe_pre_attn", k_pe)
+
         attn_out = self.mla_attn(
             q,
             kv_c_normed,
@@ -221,6 +317,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         if self.g_proj is not None:
-            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
+            _mla_debug_stats(f"{self.prefix}_attn_out_pre_gate", attn_out)
+            gate = self.g_proj(hidden_states)[0].sigmoid()
+            _mla_debug_stats(f"{self.prefix}_gate_value", gate)
+            attn_out = attn_out * gate
+            _mla_debug_stats(f"{self.prefix}_attn_out_post_gate", attn_out)
 
-        return self.o_proj(attn_out)[0]
+        out = self.o_proj(attn_out)[0]
+        if self.g_proj is not None:
+            _mla_debug_stats(f"{self.prefix}_o_proj_out", out)
+        return out

@@ -9,7 +9,9 @@ from torch import nn
 
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
+    get_dp_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
@@ -67,6 +69,181 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
+
+import os as _debug_os  # noqa: E402
+
+_KDA_DEBUG_STATS = _debug_os.environ.get("KDA_DEBUG_STATS") == "1"
+_kda_debug_call_counts: dict[str, int] = {}
+
+# Depth-probe checkpoints for the logit-lens diagnostic. An earlier coarse
+# sweep (0,3,11,23,35,47,59,71,83,92 plus a post-attn_res "final_pre_norm"
+# checkpoint) found layer_083 completely uncollapsed (uniform local entropy)
+# while layer_092 and final_pre_norm showed dramatic, matching collapse on
+# the same real decode steps -- localizing the bug to a 9-layer window. This
+# sweep checkpoints every layer in that window to find the exact transition.
+_LOGIT_LENS_LAYERS = frozenset({84, 85, 86, 87, 88, 89, 90, 91, 92})
+
+# Tensor-dump diagnostic: when KDA_DUMP_DIR is set, save per-layer boundary
+# hidden states (bf16, CPU) for offline fp64 replay. TP rank 0 of every DP
+# replica (states are replicated at layer boundaries); the active replica is
+# identified offline by its prefill token count + matching garbage logits.
+_KDA_DUMP_DIR = _debug_os.environ.get("KDA_DUMP_DIR") or ""
+# Several size-1 dummy decode passes (cudagraph capture) run before the real
+# request, so keep enough call slots; the real prefill is identified offline
+# by its 95-token shape + input_ids.
+_KDA_DUMP_MAX_CALLS = int(_debug_os.environ.get("KDA_DUMP_MAX_CALLS", "8"))
+_KDA_DUMP_MAX_TOKENS = int(_debug_os.environ.get("KDA_DUMP_MAX_TOKENS", "256"))
+
+
+def _debug_dump_states(
+    tag: str,
+    hidden_states: torch.Tensor,
+    extra: dict[str, torch.Tensor] | None = None,
+) -> None:
+    if not _KDA_DUMP_DIR:
+        return
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    if hidden_states.dim() < 2 or hidden_states.size(0) > _KDA_DUMP_MAX_TOKENS:
+        # Skip large dummy-profile prefill passes; keep real prefill + decode.
+        return
+    dp_rank = _debug_dp_rank()
+    key = ("dump", tag, dp_rank)
+    count = _kda_debug_call_counts.get(key, 0)
+    if count >= _KDA_DUMP_MAX_CALLS:
+        return
+    _kda_debug_call_counts[key] = count + 1
+    try:
+        out_dir = _debug_os.path.join(_KDA_DUMP_DIR, f"dp{dp_rank}")
+        _debug_os.makedirs(out_dir, exist_ok=True)
+        payload = {
+            "hidden": hidden_states.detach().to("cpu", torch.bfloat16, copy=True)
+        }
+        if extra:
+            payload.update({k: v.detach().cpu() for k, v in extra.items()})
+        torch.save(
+            payload, _debug_os.path.join(out_dir, f"{tag}_call{count}.pt")
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("KDA_DUMP dp=%d %s FAILED: %r", dp_rank, tag, exc)
+
+
+def _debug_dp_rank() -> int:
+    try:
+        return get_dp_group().rank_in_group
+    except Exception:
+        return -1
+
+
+def _debug_stats(tag: str, x: torch.Tensor, max_calls: int = 4) -> None:
+    """Temporary diagnostic: log tensor stats for a few calls, TP rank 0 of
+    every DP replica (tagged with dp= so idle vs. active ranks are visible)."""
+    if not _KDA_DEBUG_STATS:
+        return
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    dp_rank = _debug_dp_rank()
+    count = _kda_debug_call_counts.get((tag, dp_rank), 0)
+    if count >= max_calls:
+        return
+    _kda_debug_call_counts[(tag, dp_rank)] = count + 1
+    xf = x.detach().float()
+    nan_count = torch.isnan(xf).sum().item()
+    inf_count = torch.isinf(xf).sum().item()
+    finite = xf[torch.isfinite(xf)]
+    if finite.numel() == 0:
+        logger.warning(
+            "KDA_DEBUG dp=%d %s call=%d shape=%s ALL NON-FINITE nan=%d inf=%d",
+            dp_rank, tag, count, tuple(x.shape), nan_count, inf_count,
+        )
+        return
+    logger.warning(
+        "KDA_DEBUG dp=%d %s call=%d shape=%s dtype=%s mean=%.6f std=%.6f min=%.6f "
+        "max=%.6f absmax=%.6f nan=%d inf=%d last_row_absmax=%.6f",
+        dp_rank, tag, count, tuple(x.shape), x.dtype,
+        finite.mean().item(), finite.std().item(),
+        finite.min().item(), finite.max().item(),
+        finite.abs().max().item(), nan_count, inf_count,
+        x[-1].detach().float().abs().max().item() if x.dim() >= 1 and x.shape[0] > 0 else -1.0,
+    )
+
+
+def _debug_topk(tag: str, logits: torch.Tensor, max_calls: int = 6, k: int = 8) -> None:
+    """Temporary diagnostic: log top-k logits for the last row, TP rank 0 of
+    every DP replica."""
+    if not _KDA_DEBUG_STATS:
+        return
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    dp_rank = _debug_dp_rank()
+    count = _kda_debug_call_counts.get((tag, dp_rank), 0)
+    if count >= max_calls:
+        return
+    _kda_debug_call_counts[(tag, dp_rank)] = count + 1
+    last = logits[-1].detach().float()
+    values, indices = torch.topk(last, min(k, last.numel()))
+    probs = torch.softmax(last, dim=-1)
+    top_probs = probs[indices]
+    entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum().item()
+    logger.warning(
+        "KDA_DEBUG dp=%d %s call=%d top%d_ids=%s top%d_logits=%s top%d_probs=%s entropy=%.4f vocab=%d",
+        dp_rank, tag, count, k, indices.tolist(), k, [round(v, 4) for v in values.tolist()],
+        k, [round(v, 4) for v in top_probs.tolist()], entropy, last.numel(),
+    )
+
+
+def _debug_logit_lens(
+    model: "KimiLinearModel", tag: str, hidden_states: torch.Tensor, max_calls: int = 2
+) -> None:
+    """Logit-lens probe: apply the model's *real* final norm + lm_head to an
+    intermediate layer's hidden state (last token position only) to see
+    whether degenerate top-token predictions are already present at this
+    depth, or only emerge later.
+
+    Deliberately uses logits_processor._apply_head() -- the local matmul only
+    -- instead of calling logits_processor(...)/lm_head directly, which would
+    issue a TP all-gather collective. An earlier version called the full
+    collective path gated by rank, which deadlocked the whole job (rank
+    mismatch); fixing the gating still hung for a second, not-yet-understood
+    reason (likely interference with concurrent EP all2all collectives from
+    inside the decoder layer loop). Restricting to the rank-local partial
+    logits avoids the collective entirely -- it's not the true global top-k,
+    but a healthy vs. degenerate local-shard distribution is still meaningful
+    signal, and this is guaranteed not to hang.
+    """
+    if not _KDA_DEBUG_STATS:
+        return
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    lm_head = getattr(model, "_debug_lm_head", None)
+    logits_processor = getattr(model, "_debug_logits_processor", None)
+    if lm_head is None or logits_processor is None:
+        return
+    dp_rank = _debug_dp_rank()
+    count = _kda_debug_call_counts.get((tag, dp_rank), 0)
+    if count >= max_calls:
+        return
+    _kda_debug_call_counts[(tag, dp_rank)] = count + 1
+    try:
+        last_row = hidden_states[-1:].clone()
+        normed = model.norm(last_row, None)
+        local_logits = logits_processor._apply_head(lm_head, normed, None)
+        if local_logits is None:
+            return
+        last = local_logits[-1].detach().float()
+        k = 8
+        values, indices = torch.topk(last, min(k, last.numel()))
+        probs = torch.softmax(last, dim=-1)
+        top_probs = probs[indices]
+        entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum().item()
+        logger.warning(
+            "KDA_DEBUG dp=%d LOGITLENS_%s call=%d (LOCAL-SHARD-ONLY, size=%d) "
+            "top%d_local_ids=%s top%d_local_probs=%s local_entropy=%.4f",
+            dp_rank, tag, count, last.numel(), k, indices.tolist(), k,
+            [round(v, 4) for v in top_probs.tolist()], entropy,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("KDA_DEBUG dp=%d LOGITLENS_%s call=%d FAILED: %r", dp_rank, tag, count, exc)
 
 
 class KimiMLP(nn.Module):
@@ -210,7 +387,11 @@ class KimiMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        self.gate.e_score_correction_bias = nn.Parameter(torch.empty(num_experts))
+        # Preserve FP32 checkpoint values and match FP32 router logits.
+        # (Upstream vLLM PR #50761, commit c66681067.)
+        self.gate.e_score_correction_bias = nn.Parameter(
+            torch.empty(num_experts, dtype=torch.float32)
+        )
 
         if self.num_shared_experts is not None:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
@@ -600,6 +781,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        _debug_fine = _KDA_DEBUG_STATS and self.layer_idx < 16
         prefix_sum = hidden_states
         hidden_states = _apply_attn_res(
             prefix_sum,
@@ -608,13 +790,19 @@ class KimiDecoderLayer(nn.Module):
             self.self_attention_res_norm,
             self.prev_valid_blocks,
         )
+        if _debug_fine:
+            _debug_stats(f"L{self.layer_idx:03d}_a_attnres_self", hidden_states, max_calls=1)
 
         if self.is_block_write_layer:
             block_residual[:, self.block_write_idx, :].copy_(prefix_sum)
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
+        if _debug_fine:
+            _debug_stats(f"L{self.layer_idx:03d}_b_input_ln", hidden_states, max_calls=1)
         hidden_states = self._run_self_attn(positions, hidden_states)
+        if _debug_fine:
+            _debug_stats(f"L{self.layer_idx:03d}_c_self_attn", hidden_states, max_calls=1)
 
         if prefix_sum is not None:
             prefix_sum = prefix_sum + hidden_states
@@ -631,10 +819,18 @@ class KimiDecoderLayer(nn.Module):
             self.mlp_res_norm,
             mlp_valid_blocks,
         )
+        if _debug_fine:
+            _debug_stats(f"L{self.layer_idx:03d}_d_attnres_mlp", hidden_states, max_calls=1)
 
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if _debug_fine:
+            _debug_stats(f"L{self.layer_idx:03d}_e_post_ln", hidden_states, max_calls=1)
         hidden_states = self.mlp(hidden_states)
+        if _debug_fine:
+            _debug_stats(f"L{self.layer_idx:03d}_f_mlp", hidden_states, max_calls=1)
         prefix_sum = prefix_sum + hidden_states
+        if _debug_fine:
+            _debug_stats(f"L{self.layer_idx:03d}_g_prefix_sum", prefix_sum, max_calls=1)
         return prefix_sum, block_residual
 
 
@@ -747,6 +943,17 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            _debug_stats("embed", hidden_states)
+            _debug_dump_states(
+                "embed",
+                hidden_states,
+                {
+                    "input_ids": input_ids
+                    if input_ids is not None
+                    else torch.zeros(0, dtype=torch.long),
+                    "positions": positions,
+                },
+            )
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -806,6 +1013,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 self._maybe_add_hidden_state(
                     aux_hidden_states, layer_idx + 1, hidden_states, residual
                 )
+            _debug_dump_states(f"layer_{layer_idx:03d}", hidden_states)
+            if layer_idx < 16 or layer_idx % 10 == 0 or layer_idx == self.end_layer - 1:
+                _debug_stats(f"layer_{layer_idx:03d}", hidden_states, max_calls=1)
+            if layer_idx in _LOGIT_LENS_LAYERS:
+                # Re-enabled with far fewer checkpoints (10 vs. the earlier
+                # ~18) and run with extra GPU memory headroom (see the
+                # SMOKE_GPU_MEMORY_UTILIZATION override used for this run) to
+                # avoid the earlier OOM-like signal-kill on the real request.
+                _debug_logit_lens(self, f"layer_{layer_idx:03d}", hidden_states, max_calls=60)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -819,6 +1035,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             self.output_attn_res_norm,
             attn_res_block_num,
         )
+        _debug_stats("final_pre_norm", hidden_states)
+        _debug_dump_states("final_pre_norm", hidden_states)
+        # The layer_092 logit-lens checkpoint above captures hidden_states
+        # *inside* the per-layer loop, i.e. before this model-level
+        # _apply_attn_res call -- which pools the entire residual bank
+        # (all attn_res_block_size-spaced blocks across all 93 layers) into
+        # one final combination. That pooling is NOT reflected in the
+        # layer_092 checkpoint, so it is not actually representative of what
+        # compute_logits()'s norm + lm_head receive. This checkpoint is.
+        _debug_logit_lens(self, "final_pre_norm", hidden_states, max_calls=60)
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.
         if aux_hidden_states:
@@ -988,6 +1214,12 @@ class KimiLinearForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=logit_scale
         )
+        if _KDA_DEBUG_STATS:
+            # Logit-lens probe: let the model submodule apply the *real* final
+            # norm + lm_head to intermediate hidden states, to see where
+            # degenerate predictions first appear across depth.
+            self.model._debug_lm_head = self.lm_head
+            self.model._debug_logits_processor = self.logits_processor
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1055,11 +1287,72 @@ class KimiLinearForCausalLM(
         # The model's final norm is applied here (not at the end of forward) so
         # that the pre-norm hidden states can be fed to the MTP draft model.
         hidden_states = self.model.norm(hidden_states, None)
-        return self.logits_processor(self.lm_head, hidden_states)
+        _debug_stats("final_normed", hidden_states)
+        if _KDA_DUMP_DIR and not getattr(self, "_debug_head_dumped_runtime", False):
+            self._debug_head_dumped_runtime = True
+            self._debug_dump_head_weights("runtime")
+            if get_tensor_model_parallel_rank() == 0:
+                try:
+                    dp_rank = _debug_dp_rank()
+                    torch.save(
+                        {
+                            "normed": hidden_states.detach()
+                            .to("cpu", torch.bfloat16, copy=True)
+                        },
+                        _debug_os.path.join(
+                            _KDA_DUMP_DIR, f"normed_runtime_dp{dp_rank}.pt"
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("normed dump FAILED: %r", exc)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is not None:
+            _debug_topk("logits", logits)
+        return logits
+
+    def _debug_dump_head_weights(self, phase: str) -> None:
+        """Diagnostic: save the actual loaded final-norm / lm_head / embed
+        weight values so they can be compared against the checkpoint offline.
+        Gated by KDA_DUMP_DIR; TP rank 0 of every DP replica writes one file
+        per phase."""
+        if not _KDA_DUMP_DIR:
+            return
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        try:
+            dp_rank = _debug_dp_rank()
+            payload: dict[str, torch.Tensor] = {}
+            if isinstance(self.lm_head, ParallelLMHead):
+                payload["lm_head.weight"] = self.lm_head.weight.detach().cpu()
+            if isinstance(self.model.norm, RMSNorm):
+                payload["model.norm.weight"] = self.model.norm.weight.detach().cpu()
+            if isinstance(self.model.output_attn_res_norm, RMSNorm):
+                payload["output_attn_res_norm.weight"] = (
+                    self.model.output_attn_res_norm.weight.detach().cpu()
+                )
+                payload["output_attn_res_proj.weight"] = (
+                    self.model.output_attn_res_proj.weight.detach().cpu()
+                )
+            emb = getattr(self.model, "embed_tokens", None)
+            if emb is not None and isinstance(emb.weight, torch.Tensor):
+                payload["embed_tokens.weight"] = emb.weight.detach().cpu()
+            payload["_logits_scale"] = torch.tensor(
+                [float(self.logits_processor.scale)]
+            )
+            torch.save(
+                payload,
+                _debug_os.path.join(
+                    _KDA_DUMP_DIR, f"headweights_{phase}_dp{dp_rank}.pt"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("head-weights dump (%s) FAILED: %r", phase, exc)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        self._debug_dump_head_weights("postload")
+        return loaded
