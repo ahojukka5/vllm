@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from vllm.platforms import current_platform
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import (
         FusedMoEConfig,
@@ -249,14 +251,49 @@ def apply_moe_activation(
         assert config.activation_situ_beta is not None, (
             "SITU requires activation_situ_beta from FusedMoEConfig"
         )
-        torch.ops._C.situ_and_mul(
-            output,
-            input,
-            config.activation_situ_beta,
-            -1.0
-            if config.activation_situ_linear_beta is None
-            else config.activation_situ_linear_beta,
-        )
+        linear_beta = config.activation_situ_linear_beta
+        if hasattr(torch.ops._C, "situ_and_mul"):
+            torch.ops._C.situ_and_mul(
+                output,
+                input,
+                config.activation_situ_beta,
+                -1.0 if linear_beta is None else linear_beta,
+            )
+        elif current_platform.is_rocm():
+            # Stable-libtorch is unavailable in this ROCm/PyTorch build;
+            # use the fused single-launch Triton kernel (same fp32 math).
+            from vllm.model_executor.layers.fused_moe.situ_triton import (
+                situ_and_mul_triton,
+            )
+
+            situ_and_mul_triton(
+                output,
+                input,
+                config.activation_situ_beta,
+                -1.0 if linear_beta is None else linear_beta,
+            )
+        else:
+            # Keep the fallback bounded to one output-sized scratch tensor
+            # instead of the many fp32 temporaries used by
+            # SituAndMul.forward_native.
+            d = output.size(-1)
+            gate = input[..., :d]
+            up = input[..., d:]
+            scratch = torch.empty_like(output)
+
+            torch.div(gate, config.activation_situ_beta, out=output)
+            torch.tanh(output, out=output)
+            output.mul_(config.activation_situ_beta)
+            torch.sigmoid(gate, out=scratch)
+            output.mul_(scratch)
+
+            if linear_beta is None or linear_beta <= 0:
+                output.mul_(up)
+            else:
+                torch.div(up, linear_beta, out=scratch)
+                torch.tanh(scratch, out=scratch)
+                scratch.mul_(linear_beta)
+                output.mul_(scratch)
     elif activation == MoEActivation.SWIGLUOAI:
         torch.ops._C.swigluoai_and_mul(output, input)
     elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
