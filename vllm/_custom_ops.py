@@ -2265,8 +2265,14 @@ def _native_moe_align_block_size(
         flat = torch.where(valid, mapped, flat)
 
     fe = torch.where(valid, flat, torch.full_like(flat, num_experts))
-    counts_full = torch.nn.functional.one_hot(fe, num_experts + 1).sum(dim=0)
-    counts_full = counts_full.to(torch.long)
+    # scatter_add_ counting instead of one_hot().sum(0): one_hot
+    # materializes a [T, num_experts+1] int64 tensor (3.7 GiB at the
+    # DP-gathered profiling shape T=512k), blowing the profiling memory
+    # budget and shrinking available KV cache below zero.
+    counts_full = torch.zeros(
+        num_experts + 1, device=device, dtype=torch.long
+    )
+    counts_full.scatter_add_(0, fe, torch.ones_like(fe))
     padded_full = ((counts_full + block_size - 1) // block_size) * block_size
     padded_starts_full = torch.cumsum(padded_full, dim=0) - padded_full
     expert_starts_full = torch.cumsum(counts_full, dim=0) - counts_full
