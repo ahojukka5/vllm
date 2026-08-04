@@ -116,17 +116,15 @@ def moe_touched_expert_mask(
 ) -> torch.Tensor:
     """GPU-resident per-local-expert "receives >=1 token" mask (int32 [E]).
 
-    Capture-safe: no D2H sync. topk_ids [T, k] global ids; expert_map [G]
-    maps global -> local or -1.
+    Capture-safe: no D2H sync, no dynamic shapes, and no torch.bincount
+    (its HIP implementation is illegal during stream capture). topk_ids
+    [T, k] global ids; expert_map [G] maps global -> local or -1.
     """
     local = expert_map[topk_ids.long()]
-    valid = local >= 0
-    clamped = torch.where(valid, local, torch.zeros_like(local))
-    counts = torch.bincount(
-        clamped.reshape(-1), minlength=num_local_experts + 1
-    )[:num_local_experts]
-    # `clamped` maps invalid entries to 0; subtract their contribution so an
-    # expert 0 with only-invalid assignments is not marked touched.
-    invalid = (~valid).sum()
-    counts[0] = counts[0] - invalid
-    return (counts > 0).to(torch.int32)
+    valid = (local >= 0).reshape(-1, 1)
+    clamped = torch.where(local >= 0, local, torch.zeros_like(local))
+    onehot = torch.nn.functional.one_hot(
+        clamped.reshape(-1).long(), num_local_experts
+    ).bool()
+    onehot &= valid
+    return onehot.any(0).to(torch.int32)
