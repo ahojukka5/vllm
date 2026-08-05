@@ -15,6 +15,7 @@ import os
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -264,7 +265,21 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         # At low batch sizes each step routes to only a few of the local
         # experts (topk=16 of 896 global; ~3 of 14 local at BS=1), so
         # dequantizing every expert every step wastes ~5x the bandwidth.
-        if (
+        #
+        # VLLM_ROCM_SELECTIVE_DEQUANT gates both selective paths. Default OFF:
+        # untouched expert slices of the torch.empty workspace hold garbage,
+        # and under DP+EP that garbage reaches valid tokens' outputs
+        # (fluent-but-wrong logits at 8-node EP64; the pre-selective commit
+        # 01ed76192 passes the semantic smoke, aaa584c40 fails it).
+        if not envs.VLLM_ROCM_SELECTIVE_DEQUANT:
+            touched = None
+            w1_dequant = self._dequantize_weights(
+                w1, self.w1_scale_val, hidden_states.dtype
+            )
+            w2_dequant = self._dequantize_weights(
+                w2, self.w2_scale_val, hidden_states.dtype
+            )
+        elif (
             expert_map is not None
             and self.ocp_mx_scheme == OCP_MX_Scheme.w_mxfp4
             and torch.cuda.is_current_stream_capturing()

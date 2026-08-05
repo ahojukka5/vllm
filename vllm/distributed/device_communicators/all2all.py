@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -39,6 +40,9 @@ if has_flashinfer_nvlink_one_sided():
 
 
 logger = init_logger(__name__)
+
+
+_FUSED_DISPATCH = os.environ.get("VLLM_K3_FUSED_DISPATCH", "0") == "1"
 
 
 class AgRsAll2AllManager(All2AllManagerBase):
@@ -119,6 +123,31 @@ class AgRsAll2AllManager(All2AllManagerBase):
         tensors_to_gather = [hidden_states, topk_weights, topk_ids]
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
+
+        if _FUSED_DISPATCH and extra_tensors is None:
+            # Byte-level fusion: the 3-tensor list all_gatherv loops one
+            # collective per tensor, paying full collective latency 3x per
+            # layer (~0.3-3 ms each on RCCL). Concatenate as bytes into one
+            # flat payload, run ONE all_gatherv, then split+view back.
+            # topk_weights/topk_ids are tiny (64 B/token) so the extra bytes
+            # are free next to hidden_states (14 KB/token).
+            flats = []
+            meta = []
+            for t in tensors_to_gather:
+                t = t.contiguous()
+                b = t.view(torch.uint8).view(t.shape[0], -1)
+                flats.append(b)
+                meta.append((t.shape, t.dtype, b.shape[1]))
+            packed = torch.cat(flats, dim=1)
+            gathered = dist_group.all_gatherv(packed, dim=0, sizes=sizes)
+            outs = []
+            off = 0
+            for shape, dtype, nbytes in meta:
+                part = gathered[:, off:off + nbytes].contiguous().view(dtype)
+                outs.append(part.view(sum(sizes), *shape[1:]))
+                off += nbytes
+            hidden_states, topk_weights, topk_ids = outs
+            return hidden_states, topk_weights, topk_ids
 
         gathered_tensors = dist_group.all_gatherv(
             tensors_to_gather,
