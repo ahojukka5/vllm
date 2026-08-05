@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from functools import partial
 
 import torch
@@ -23,6 +24,8 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
+
+_GROUPED_TOPK_FAST = os.environ.get("VLLM_GROUPED_TOPK_FAST", "0") == "1"
 
 
 def fused_grouped_topk(
@@ -115,6 +118,30 @@ def grouped_topk(
         scores = gating_output.sigmoid()
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    if num_expert_group == 1 and topk_group == 1 and _GROUPED_TOPK_FAST:
+        # Single-group degenerate case (K3: num_expert_group=1, topk_group=1):
+        # the group scoring/masking machinery below is a no-op (the one group
+        # always wins, the mask is all-True). Skip straight to biased top-k —
+        # numerically identical, but avoids 4+ topk/sort/mask kernel launches
+        # per MoE layer (measured +11.3% at conc-1 on the GLM-4.7 MI250X
+        # campaign; ~4-9 ms/step of the K3 decode step in the pdec profile).
+        # Env-gated so A/B arms stay comparable. Ported from the GLM-4.7
+        # gfx90a optimization campaign (lumi_vllm_stack).
+        use_sorted = envs.VLLM_BATCH_INVARIANT
+        if e_score_correction_bias is not None:
+            biased_scores = scores + e_score_correction_bias.unsqueeze(0)
+            topk_ids = torch.topk(biased_scores, k=topk, dim=-1,
+                                  sorted=use_sorted)[1]
+            topk_weights = scores.gather(1, topk_ids)
+        else:
+            topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1,
+                                                sorted=use_sorted)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
+        return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
     num_token = scores.size(0)
     if e_score_correction_bias is not None:
