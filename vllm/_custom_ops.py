@@ -2906,6 +2906,7 @@ def concat_and_cache_mla(
         and kv_c.stride(-1) == 1
         and k_pe.stride(-1) == 1
         and kv_cache.dim() == 3
+        and envs.VLLM_ROCM_CONCAT_MLA_TRITON
     ):
         # Single-launch Triton path: no torch.nonzero (hidden GPU sync,
         # capture-illegal), ~6 fewer launches per MLA layer per step.
