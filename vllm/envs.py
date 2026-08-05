@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_CONCAT_MLA_TRITON: bool = False
+    VLLM_ROCM_SELECTIVE_DEQUANT: bool = False
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1303,7 +1304,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 532cfc666+situ-native FAIL); default OFF (PyTorch fallback) until the
     # kernel is repaired and re-validated.
     "VLLM_ROCM_CONCAT_MLA_TRITON": lambda: (
-        os.getenv("VLLM_ROCM_CONCAT_MLA_TRITON", "False").lower() in ("true", "1")
+        os.getenv("VLLM_ROCM_CONCAT_MLA_TRITON", "True").lower() in ("true", "1")
+    ),
+    # Selective MXFP4 dequant (aaa584c40): untouched expert slices of the
+    # torch.empty workspace hold garbage; under DP+EP that garbage reaches
+    # valid tokens (fluent-but-wrong at 8-node EP64; bisect15/16 bracket).
+    # Default OFF = full dequant until the read path is found and fixed.
+    "VLLM_ROCM_SELECTIVE_DEQUANT": lambda: (
+        os.getenv("VLLM_ROCM_SELECTIVE_DEQUANT", "False").lower() in ("true", "1")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
