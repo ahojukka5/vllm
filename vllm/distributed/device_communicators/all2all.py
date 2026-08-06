@@ -166,6 +166,29 @@ class _EpFabric:
             raise RuntimeError("epfabric: epf_allreduce_sum_bf16 failed")
 
 
+# Timing instrumentation for the epfabric path (xbnd7: engaged but 15%
+# slower than RCCL despite a 50-100x faster transport microbench — find
+# where the integration overhead lives). Accumulates per-call wall time
+# by phase; rank 0 logs every 2048 calls.
+_EPF_STATS: dict = {"pack": 0.0, "copyin": 0.0, "sync": 0.0,
+                    "transport": 0.0, "copyout": 0.0, "n": 0}
+
+
+def _epf_stat(phase: str, dt: float):
+    s = _EPF_STATS
+    s[phase] += dt
+    if phase == "copyout":
+        s["n"] += 1
+        if s["n"] % 2048 == 0:
+            n = s["n"]
+            logger.info(
+                "K3-EPF-STATS n=%d us/call: pack=%.1f copyin=%.1f sync=%.1f "
+                "transport=%.1f copyout=%.1f",
+                n, 1e6 * s["pack"] / n, 1e6 * s["copyin"] / n,
+                1e6 * s["sync"] / n, 1e6 * s["transport"] / n,
+                1e6 * s["copyout"] / n)
+
+
 class AgRsAll2AllManager(All2AllManagerBase):
     """
     An implementation of all2all communication based on
@@ -360,9 +383,19 @@ class AgRsAll2AllManager(All2AllManagerBase):
         epf.ensure_registered(
             _HS_BUFS["epf_disp_in"], _HS_BUFS["epf_disp_out"])
 
+        import time
+        t0 = time.perf_counter()
+        # rbuf was read by the previous call's async H2D copyout; wait for
+        # that before the transport overwrites it (xbnd7 race).
+        ev = _HS_BUFS.get("epf_disp_ev")
+        if ev is not None:
+            ev.synchronize()
         xb.copy_(packed, non_blocking=True)
+        t1 = time.perf_counter()
         torch.cuda.current_stream(device).synchronize()
+        t2 = time.perf_counter()
         epf.allgather(max_sz * W)
+        t3 = time.perf_counter()
 
         if total < n * max_sz:
             gathered_cpu = torch.cat(
@@ -371,6 +404,15 @@ class AgRsAll2AllManager(All2AllManagerBase):
         else:
             gathered_cpu = ob[:total * W].view(total, W)
         gathered = gathered_cpu.to(device, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(device))
+        _HS_BUFS["epf_disp_ev"] = ev
+        t4 = time.perf_counter()
+        _epf_stat("pack", t1 - t0)
+        _epf_stat("copyin", t1 - t0)
+        _epf_stat("sync", t2 - t1)
+        _epf_stat("transport", t3 - t2)
+        _epf_stat("copyout", t4 - t3)
 
         res = []
         off = 0
@@ -402,11 +444,29 @@ class AgRsAll2AllManager(All2AllManagerBase):
         epf.ensure_registered(
             _HS_BUFS["epf_comb_in"], _HS_BUFS["epf_comb_out"])
 
+        import time
+        t0 = time.perf_counter()
+        ev = _HS_BUFS.get("epf_comb_ev")
+        if ev is not None:
+            ev.synchronize()
         xb.view(total, H).copy_(hidden_states, non_blocking=True)
+        t1 = time.perf_counter()
         torch.cuda.current_stream(device).synchronize()
+        t2 = time.perf_counter()
         epf.allreduce_bf16(total * H)
+        t3 = time.perf_counter()
         out = ob[:total * H * 2].view(torch.bfloat16).view(total, H)
-        return out[off:off + rows].to(device, non_blocking=True)
+        res = out[off:off + rows].to(device, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(device))
+        _HS_BUFS["epf_comb_ev"] = ev
+        t4 = time.perf_counter()
+        _epf_stat("pack", t1 - t0)
+        _epf_stat("copyin", t1 - t0)
+        _epf_stat("sync", t2 - t1)
+        _epf_stat("transport", t3 - t2)
+        _epf_stat("copyout", t4 - t3)
+        return res
 
     def _host_staged_ag(self, tensors_to_gather, sizes, device):
         """all_gatherv via pinned staging + gloo all_gather on the DP gloo twin.
