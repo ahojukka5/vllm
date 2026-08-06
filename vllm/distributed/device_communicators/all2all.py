@@ -54,6 +54,17 @@ _FUSED_DISPATCH = os.environ.get("VLLM_K3_FUSED_DISPATCH", "0") == "1"
 # Quantified by scripts/gloo_ag_probe.py (arm d = the exact op sequence).
 _HOSTSTAGED_EP = os.environ.get("VLLM_K3_HOSTSTAGED_EP", "0") == "1"
 
+# libfabric CXI host-staged EP transport (k3-epfabric). Replaces the RCCL
+# ring for DP-group dispatch/combine with a 1-hop tagged all-to-all over
+# Cray libfabric: measured 26 us for the 14KB x 8-rank dispatch shape vs
+# ~1.3-2.6 ms for RCCL on this stack (epf_bench.c; GPU-direct CXI is dead
+# at the kernel driver, so staging is mandatory). Addresses bootstrap
+# through the existing gloo cpu_group twin (works in-engine on LUMI,
+# unlike torchrun-bootstrapped gloo). Correctness: allreduce gathers then
+# reduces in rank order with fp32 accumulation -> bit-identical on all
+# ranks. Kill switch: unset VLLM_K3_EPFABRIC.
+_EPFABRIC_EP = os.environ.get("VLLM_K3_EPFABRIC", "0") == "1"
+
 _HS_BUFS: dict = {}
 _HS_BF16_OK: "bool | None" = None
 
@@ -67,6 +78,92 @@ def _hs_pin(key: str, nbytes: int) -> torch.Tensor:
                           pin_memory=True)
         _HS_BUFS[key] = buf
     return buf
+
+
+class _EpFabric:
+    """ctypes wrapper over k3-epfabric/libepfabric.so (Cray libfabric CXI).
+
+    One instance per process, bound to the DP group. Buffers are torch
+    pinned-memory registered with libfabric; grow triggers re-register.
+    """
+
+    _inst: "_EpFabric | None" = None
+
+    def __init__(self, cpu_group, rank_in_group: int, world: int):
+        import ctypes
+
+        import torch.distributed as dist
+
+        so = os.environ.get(
+            "K3_EPFABRIC_SO",
+            "/pfs/lustref1/flash/project_462001519/juaho/dev/lumi-kimi-k3/"
+            "k3-epfabric/libepfabric.so",
+        )
+        lib = ctypes.CDLL(so)
+        lib.epf_open.restype = int
+        lib.epf_connect.restype = int
+        lib.epf_connect.argtypes = [ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_void_p, ctypes.c_size_t]
+        lib.epf_getname.restype = int
+        lib.epf_getname.argtypes = [ctypes.c_void_p,
+                                    ctypes.POINTER(ctypes.c_size_t)]
+        lib.epf_register.restype = int
+        lib.epf_register.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                     ctypes.c_void_p, ctypes.c_size_t]
+        lib.epf_allgather.restype = int
+        lib.epf_allgather.argtypes = [ctypes.c_size_t]
+        lib.epf_allreduce_sum_bf16.restype = int
+        lib.epf_allreduce_sum_bf16.argtypes = [ctypes.c_size_t]
+        self.lib = lib
+        self.world = world
+        self.rank = rank_in_group
+        self.reg = (None, 0, None, 0)
+
+        if lib.epf_open() != 0:
+            raise RuntimeError("epfabric: epf_open failed")
+        name = bytes(64)
+        n = ctypes.c_size_t(64)
+        if lib.epf_getname(name, ctypes.byref(n)) != 0:
+            raise RuntimeError("epfabric: epf_getname failed")
+        my = name[:n.value]
+        # Address exchange via the DP gloo twin (proven in-engine).
+        blob = [None] * world
+        dist.all_gather_object(blob, (rank_in_group, my), group=cpu_group)
+        blob.sort(key=lambda x: x[0])
+        alen = len(blob[0][1])
+        if any(len(b[1]) != alen for b in blob):
+            raise RuntimeError("epfabric: ragged addresses")
+        flat = b"".join(b[1] for b in blob)
+        buf = ctypes.create_string_buffer(flat, len(flat))
+        if lib.epf_connect(rank_in_group, world, buf, alen) != 0:
+            raise RuntimeError("epfabric: epf_connect failed")
+        self.alen = alen
+        logger.info(
+            "K3-EPFABRIC up: world=%d rank=%d addr_len=%d (CXI 1-hop A2A)",
+            world, rank_in_group, alen)
+
+    @classmethod
+    def get(cls, cpu_group, rank_in_group: int, world: int) -> "_EpFabric":
+        if cls._inst is None:
+            cls._inst = _EpFabric(cpu_group, rank_in_group, world)
+        return cls._inst
+
+    def ensure_registered(self, sbuf: torch.Tensor, rbuf: torch.Tensor):
+        sp, rp = sbuf.data_ptr(), rbuf.data_ptr()
+        sc, rc_ = sbuf.numel(), rbuf.numel()
+        if self.reg == (sp, sc, rp, rc_):
+            return
+        if self.lib.epf_register(sp, sc, rp, rc_) != 0:
+            raise RuntimeError("epfabric: epf_register failed")
+        self.reg = (sp, sc, rp, rc_)
+
+    def allgather(self, nbytes: int):
+        if self.lib.epf_allgather(nbytes) != 0:
+            raise RuntimeError("epfabric: epf_allgather failed")
+
+    def allreduce_bf16(self, nelem: int):
+        if self.lib.epf_allreduce_sum_bf16(nelem) != 0:
+            raise RuntimeError("epfabric: epf_allreduce_sum_bf16 failed")
 
 
 class AgRsAll2AllManager(All2AllManagerBase):
@@ -148,6 +245,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
+        if (_EPFABRIC_EP and extra_tensors is None
+                and not is_sequence_parallel and self.dp_world_size > 1):
+            outs = self._epf_ag(tensors_to_gather, sizes,
+                                hidden_states.device)
+            return outs[0], outs[1], outs[2]
+
         if (_HOSTSTAGED_EP and extra_tensors is None
                 and not is_sequence_parallel and self.dp_world_size > 1):
             outs = self._host_staged_ag(tensors_to_gather, sizes,
@@ -205,11 +308,105 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
+        if (_EPFABRIC_EP and not is_sequence_parallel
+                and self.dp_world_size > 1):
+            return self._epf_rs(hidden_states, sizes, dist_group)
         if (_HOSTSTAGED_EP and not is_sequence_parallel
                 and self.dp_world_size > 1):
             return self._host_staged_rs(hidden_states, sizes, dist_group)
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
         return hidden_states
+
+    def _epf_group(self):
+        from vllm.distributed.parallel_state import get_dp_group
+
+        dpg = get_dp_group()
+        return _EpFabric.get(dpg.cpu_group, dpg.rank_in_group,
+                             dpg.world_size)
+
+    def _epf_ag(self, tensors_to_gather, sizes, device):
+        """all_gatherv via epfabric 1-hop A2A on pinned staging.
+
+        Same pad-to-max shape discipline as _host_staged_ag; the transport
+        is the registered pinned pair instead of gloo.
+        """
+        n = len(sizes)
+        max_sz = max(sizes)
+        total = sum(sizes)
+
+        flats, meta = [], []
+        for t in tensors_to_gather:
+            t = t.contiguous()
+            b = t.view(torch.uint8).view(t.shape[0], -1)
+            flats.append(b)
+            meta.append((t.shape, t.dtype, b.shape[1]))
+        W = sum(b.shape[1] for b in flats)
+
+        if total == 0:
+            return [
+                torch.empty(0, *shape[1:], dtype=dtype, device=device)
+                for shape, dtype, _ in meta
+            ]
+
+        packed = torch.cat(flats, dim=1)
+        if packed.shape[0] < max_sz:
+            packed = torch.cat(
+                [packed, packed.new_zeros(max_sz - packed.shape[0], W)],
+                dim=0)
+
+        epf = self._epf_group()
+        xb = _hs_pin("epf_disp_in", max_sz * W)[:max_sz * W].view(max_sz, W)
+        ob = _hs_pin("epf_disp_out", n * max_sz * W)
+        epf.ensure_registered(
+            _HS_BUFS["epf_disp_in"], _HS_BUFS["epf_disp_out"])
+
+        xb.copy_(packed, non_blocking=True)
+        torch.cuda.current_stream(device).synchronize()
+        epf.allgather(max_sz * W)
+
+        if total < n * max_sz:
+            gathered_cpu = torch.cat(
+                [ob[i * max_sz * W:(i + 1) * max_sz * W].view(
+                    max_sz, W)[:sizes[i]] for i in range(n)])
+        else:
+            gathered_cpu = ob[:total * W].view(total, W)
+        gathered = gathered_cpu.to(device, non_blocking=True)
+
+        res = []
+        off = 0
+        for shape, dtype, nbytes in meta:
+            part = gathered[:, off:off + nbytes].contiguous().view(dtype)
+            res.append(part.view(total, *shape[1:]))
+            off += nbytes
+        return res
+
+    def _epf_rs(self, hidden_states, sizes, dist_group):
+        """reduce_scatterv via epfabric gather+fp32-sum + own-slice."""
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        total, H = hidden_states.shape
+        rank = dist_group.rank_in_group
+        off = sum(sizes[:rank])
+        rows = sizes[rank]
+
+        if dtype != torch.bfloat16:
+            # fall back: fp32 handled by generic RCCL path for now
+            hidden_states = dist_group.reduce_scatterv(hidden_states,
+                                                       dim=0, sizes=sizes)
+            return hidden_states
+
+        epf = self._epf_group()
+        xb = _hs_pin("epf_comb_in",
+                     total * H * 2)[:total * H * 2].view(torch.bfloat16)
+        ob = _hs_pin("epf_comb_out", dist_group.world_size * total * H * 2)
+        epf.ensure_registered(
+            _HS_BUFS["epf_comb_in"], _HS_BUFS["epf_comb_out"])
+
+        xb.view(total, H).copy_(hidden_states, non_blocking=True)
+        torch.cuda.current_stream(device).synchronize()
+        epf.allreduce_bf16(total * H)
+        out = ob[:total * H * 2].view(torch.bfloat16).view(total, H)
+        return out[off:off + rows].to(device, non_blocking=True)
 
     def _host_staged_ag(self, tensors_to_gather, sizes, device):
         """all_gatherv via pinned staging + gloo all_gather on the DP gloo twin.
