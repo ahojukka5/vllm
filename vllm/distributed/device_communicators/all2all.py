@@ -166,12 +166,125 @@ class _EpFabric:
             raise RuntimeError("epfabric: epf_allreduce_sum_bf16 failed")
 
 
+_EPFABRIC_MODE = os.environ.get("VLLM_K3_EPFABRIC", "0")
+
+
+class _EpFabricAsync:
+    """Async epfabric (epf_async.hip): C worker thread + GPU spin-wait.
+
+    Python enqueues D2H copy, records a HIP event (via C), submits the
+    collective job, enqueues the spin kernel + H2D copy on the compute
+    stream, and returns immediately. The GPU stream stalls on the spin
+    kernel until the C thread publishes completion to a host-mapped flag
+    — identical timeline semantics to an on-stream RCCL collective, but
+    the CPU never blocks (xbnd8d: CPU sync was 470us/call, transport
+    exposed 620us of cross-rank skew; both now hide behind compute).
+    A/B buffer pairs let the CPU run two layers ahead without a
+    buffer-reuse wait.
+    """
+
+    _inst: "_EpFabricAsync | None" = None
+
+    def __init__(self, cpu_group, rank_in_group: int, world: int):
+        import ctypes
+
+        import torch.distributed as dist
+
+        so = os.environ.get(
+            "K3_EPFABRIC_ASYNC_SO",
+            "/pfs/lustref1/flash/project_462001519/juaho/dev/lumi-kimi-k3/"
+            "k3-epfabric/libepfabric_async.so",
+        )
+        lib = ctypes.CDLL(so)
+        lib.epf_open.restype = int
+        lib.epf_getname.restype = int
+        lib.epf_getname.argtypes = [ctypes.c_void_p,
+                                    ctypes.POINTER(ctypes.c_size_t)]
+        lib.epf_connect.restype = int
+        lib.epf_connect.argtypes = [ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_void_p, ctypes.c_size_t]
+        lib.epf_register_pair.restype = int
+        lib.epf_register_pair.argtypes = [ctypes.c_int, ctypes.c_uint64,
+                                          ctypes.c_size_t, ctypes.c_uint64,
+                                          ctypes.c_size_t]
+        lib.epf_record.restype = int
+        lib.epf_record.argtypes = [ctypes.c_int, ctypes.c_uint64]
+        lib.epf_submit.restype = ctypes.c_uint
+        lib.epf_submit.argtypes = [ctypes.c_int, ctypes.c_size_t,
+                                   ctypes.c_int, ctypes.c_int]
+        lib.epf_launch_wait.restype = int
+        lib.epf_launch_wait.argtypes = [ctypes.c_uint64, ctypes.c_uint]
+        lib.epf_start_worker.restype = int
+        self.lib = lib
+        self.world = world
+        self.rank = rank_in_group
+        self.pairs = {}  # id -> (sbuf tensor, rbuf tensor)
+        self.slot = 0
+
+        if lib.epf_open() != 0:
+            raise RuntimeError("epfabric_async: epf_open failed")
+        name = bytes(64)
+        n = ctypes.c_size_t(64)
+        if lib.epf_getname(name, ctypes.byref(n)) != 0:
+            raise RuntimeError("epfabric_async: epf_getname failed")
+        my = name[:n.value]
+        blob = [None] * world
+        dist.all_gather_object(blob, (rank_in_group, my), group=cpu_group)
+        blob.sort(key=lambda x: x[0])
+        alen = len(blob[0][1])
+        flat = b"".join(b[1] for b in blob)
+        buf = ctypes.create_string_buffer(flat, len(flat))
+        if lib.epf_connect(rank_in_group, world, buf, alen) != 0:
+            raise RuntimeError("epfabric_async: epf_connect failed")
+        if lib.epf_start_worker() != 0:
+            raise RuntimeError("epfabric_async: epf_start_worker failed")
+        logger.info(
+            "K3-EPFABRIC-ASYNC up: world=%d rank=%d (C-thread A2A + GPU "
+            "spin-wait)", world, rank_in_group)
+
+    @classmethod
+    def get(cls, cpu_group, rank_in_group: int,
+            world: int) -> "_EpFabricAsync":
+        if cls._inst is None:
+            cls._inst = _EpFabricAsync(cpu_group, rank_in_group, world)
+        return cls._inst
+
+    def pair(self, pid: int, scap: int, rcap: int):
+        """Return (sbuf, rbuf) for pair id, (re)registering on grow."""
+        sbuf = _hs_pin(f"epfa_s{pid}", scap)
+        rbuf = _hs_pin(f"epfa_r{pid}", rcap)
+        cur = self.pairs.get(pid)
+        if cur is not None and cur[0] is sbuf and cur[1] is rbuf:
+            return sbuf, rbuf
+        if self.lib.epf_register_pair(pid, sbuf.data_ptr(), sbuf.numel(),
+                                      rbuf.data_ptr(), rbuf.numel()) != 0:
+            raise RuntimeError("epfabric_async: epf_register_pair failed")
+        self.pairs[pid] = (sbuf, rbuf)
+        return sbuf, rbuf
+
+    def submit(self, op: int, count: int, stream_handle: int, pid: int):
+        """Record the producer event, enqueue the job, enqueue the GPU
+        spin-wait on the compute stream. Returns the flag value."""
+        self.slot = (self.slot + 1) % 64
+        if self.lib.epf_record(self.slot, stream_handle) != 0:
+            raise RuntimeError("epfabric_async: epf_record failed")
+        val = self.lib.epf_submit(op, count, self.slot, pid)
+        if val == 0:
+            raise RuntimeError("epfabric_async: epf_submit failed")
+        if self.lib.epf_launch_wait(stream_handle, val) != 0:
+            raise RuntimeError("epfabric_async: epf_launch_wait failed")
+        return val
+
+
 # Timing instrumentation for the epfabric path (xbnd7: engaged but 15%
 # slower than RCCL despite a 50-100x faster transport microbench — find
 # where the integration overhead lives). Accumulates per-call wall time
 # by phase; rank 0 logs every 2048 calls.
 _EPF_STATS: dict = {"pack": 0.0, "copyin": 0.0, "sync": 0.0,
                     "transport": 0.0, "copyout": 0.0, "n": 0}
+
+_EPFA_SEQ = 0
+_EPFA_CSEQ = 0
 
 
 def _epf_stat(phase: str, dt: float):
@@ -268,6 +381,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
+        if (_EPFABRIC_MODE == "async" and extra_tensors is None
+                and not is_sequence_parallel and self.dp_world_size > 1):
+            outs = self._epfa_ag(tensors_to_gather, sizes,
+                                 hidden_states.device)
+            return outs[0], outs[1], outs[2]
+
         if (_EPFABRIC_EP and extra_tensors is None
                 and not is_sequence_parallel and self.dp_world_size > 1):
             outs = self._epf_ag(tensors_to_gather, sizes,
@@ -331,6 +450,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
+        if (_EPFABRIC_MODE == "async" and not is_sequence_parallel
+                and self.dp_world_size > 1):
+            return self._epfa_rs(hidden_states, sizes, dist_group)
         if (_EPFABRIC_EP and not is_sequence_parallel
                 and self.dp_world_size > 1):
             return self._epf_rs(hidden_states, sizes, dist_group)
@@ -339,6 +461,125 @@ class AgRsAll2AllManager(All2AllManagerBase):
             return self._host_staged_rs(hidden_states, sizes, dist_group)
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
         return hidden_states
+
+    def _epfa_group(self):
+        from vllm.distributed.parallel_state import get_dp_group
+
+        dpg = get_dp_group()
+        return _EpFabricAsync.get(dpg.cpu_group, dpg.rank_in_group,
+                                  dpg.world_size)
+
+    def _epfa_ag(self, tensors_to_gather, sizes, device):
+        """Async staged all_gatherv: enqueue-only, no CPU blocking.
+
+        [pack on GPU] -> [D2H on stream] -> [C records event + job] ->
+        [spin kernel on stream] -> [H2D on stream] -> return. The GPU
+        stream stalls in the spin kernel until the C thread's A2A
+        completes; the CPU returns immediately (RCCL-like timeline).
+        """
+        n = len(sizes)
+        max_sz = max(sizes)
+        total = sum(sizes)
+
+        flats, meta = [], []
+        for t in tensors_to_gather:
+            t = t.contiguous()
+            b = t.view(torch.uint8).view(t.shape[0], -1)
+            flats.append(b)
+            meta.append((t.shape, t.dtype, b.shape[1]))
+        W = sum(b.shape[1] for b in flats)
+
+        if total == 0:
+            return [
+                torch.empty(0, *shape[1:], dtype=dtype, device=device)
+                for shape, dtype, _ in meta
+            ]
+
+        packed = torch.cat(flats, dim=1)
+        if packed.shape[0] < max_sz:
+            packed = torch.cat(
+                [packed, packed.new_zeros(max_sz - packed.shape[0], W)],
+                dim=0)
+
+        epf = self._epfa_group()
+        pid = _EPFA_SEQ % 2
+        globals()["_EPFA_SEQ"] = _EPFA_SEQ + 1
+        sbuf, rbuf = epf.pair(pid, max_sz * W, n * max_sz * W)
+        xb = sbuf[:max_sz * W].view(max_sz, W)
+
+        stream = torch.cuda.current_stream(device)
+        # rbuf[pid] was last read by the H2D of the call before the
+        # previous one (A/B alternation) — that event long completed.
+        ev = _HS_BUFS.get(f"epfa_disp_ev{pid}")
+        if ev is not None:
+            ev.synchronize()
+
+        xb.copy_(packed, non_blocking=True)
+        epf.submit(0, max_sz * W, stream.cuda_stream, pid)
+
+        # The H2D copyout must be stream-ordered after the spin kernel;
+        # any CPU-side read of rbuf here (e.g. a CPU torch.cat of the
+        # padded slices) would race the in-flight transport. Copy the
+        # full padded buffer to GPU and do all slicing on-device.
+        padded = torch.empty(n * max_sz, W, dtype=torch.uint8,
+                             device=device)
+        padded.copy_(rbuf[:n * max_sz * W].view(n * max_sz, W),
+                     non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        _HS_BUFS[f"epfa_disp_ev{pid}"] = ev
+
+        if total < n * max_sz:
+            gathered = torch.cat(
+                [padded[i * max_sz:i * max_sz + sizes[i]]
+                 for i in range(n)])
+        else:
+            gathered = padded
+
+        res = []
+        off = 0
+        for shape, dtype, nbytes in meta:
+            part = gathered[:, off:off + nbytes].contiguous().view(dtype)
+            res.append(part.view(total, *shape[1:]))
+            off += nbytes
+        return res
+
+    def _epfa_rs(self, hidden_states, sizes, dist_group):
+        """Async staged reduce_scatterv (bf16): enqueue-only."""
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        total, H = hidden_states.shape
+        rank = dist_group.rank_in_group
+        off = sum(sizes[:rank])
+        rows = sizes[rank]
+
+        if dtype != torch.bfloat16:
+            hidden_states = dist_group.reduce_scatterv(hidden_states,
+                                                       dim=0, sizes=sizes)
+            return hidden_states
+
+        epf = self._epfa_group()
+        pid = 2 + (_EPFA_CSEQ % 2)
+        globals()["_EPFA_CSEQ"] = _EPFA_CSEQ + 1
+        sbuf, rbuf = epf.pair(pid, total * H * 2,
+                              dist_group.world_size * total * H * 2)
+        xb = sbuf[:total * H * 2].view(torch.bfloat16).view(total, H)
+
+        stream = torch.cuda.current_stream(device)
+        ev = _HS_BUFS.get(f"epfa_comb_ev{pid}")
+        if ev is not None:
+            ev.synchronize()
+
+        xb.copy_(hidden_states, non_blocking=True)
+        epf.submit(1, total * H, stream.cuda_stream, pid)
+
+        src = rbuf[:total * H * 2].view(torch.bfloat16).view(total, H)
+        res = torch.empty(rows, H, dtype=dtype, device=device)
+        res.copy_(src[off:off + rows], non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        _HS_BUFS[f"epfa_comb_ev{pid}"] = ev
+        return res
 
     def _epf_group(self):
         from vllm.distributed.parallel_state import get_dp_group
