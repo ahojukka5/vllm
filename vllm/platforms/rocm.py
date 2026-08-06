@@ -943,7 +943,15 @@ class RocmPlatform(Platform):
     @classmethod
     def use_custom_allreduce(cls) -> bool:
         # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        if any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"]):
+            return True
+        # K3: opt-in for gfx90a (MI250X). Our classic-ABI _C_custom_ar
+        # extension (k3-customar build-glm, GLM-campaign header) is
+        # probe-validated bf16 bit-exact and 2.5-3.5x faster than RCCL for
+        # K3's TP all-reduce sizes on 8xMI250X. Upstream keeps CustomAR
+        # MI300-only, so this stays env-gated.
+        return (os.environ.get("VLLM_ROCM_GFX90A_CUSTOM_AR", "0") == "1"
+                and "gfx90a" in _GCN_ARCH)
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
