@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -24,6 +25,24 @@ try:
 except Exception:
     # For CPUs
     custom_ar = False
+
+    # K3: our ROCm wheel ships _C without the custom_all_reduce kernels. Try
+    # the classic-ABI extension (k3-customar/build-glm, GLM-campaign header,
+    # bf16 validated 2.5-3.5x vs RCCL on 8xMI250X). Loading here instead of a
+    # site .pth keeps `ray start` and other bare venv pythons free of the
+    # import-time torch/ROCm fragility seen under apptainer --rocm on LUMI.
+    _k3_so = os.environ.get(
+        "K3_AR_EXT_SO",
+        "/pfs/lustref1/flash/project_462001519/juaho/dev/lumi-kimi-k3/"
+        "k3-customar/build-glm/k3_customar_glm.so",
+    )
+    if os.environ.get("K3_AR_EXT", "1") != "0" and os.path.exists(_k3_so):
+        try:
+            torch.ops.load_library(_k3_so)
+            ops.meta_size()
+            custom_ar = True
+        except Exception:
+            pass
 
 try:
     import torch.distributed._symmetric_memory as torch_symm_mem

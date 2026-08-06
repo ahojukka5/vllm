@@ -44,6 +44,30 @@ logger = init_logger(__name__)
 
 _FUSED_DISPATCH = os.environ.get("VLLM_K3_FUSED_DISPATCH", "0") == "1"
 
+# Host-staged EP dispatch/combine: route the DP-group all_gatherv /
+# reduce_scatterv through pinned CPU buffers + gloo (TCP over hsn) instead of
+# RCCL. On LUMI MI250X, RCCL cross-node pays ~370us/hop staged through
+# aws-ofi-nccl's send/recv path (GPU-direct CXI is dead at the kernel driver,
+# see docs/kimik3-progress.md), while Cray MPICH proves a staged hop can cost
+# ~10-20us. For K3's 14KB/token decode payloads these collectives are pure
+# latency, so gloo's staging can win despite the extra D2H/H2D copies.
+# Quantified by scripts/gloo_ag_probe.py (arm d = the exact op sequence).
+_HOSTSTAGED_EP = os.environ.get("VLLM_K3_HOSTSTAGED_EP", "0") == "1"
+
+_HS_BUFS: dict = {}
+_HS_BF16_OK: "bool | None" = None
+
+
+def _hs_pin(key: str, nbytes: int) -> torch.Tensor:
+    """Grow-only pinned staging buffer (cudaHostAlloc is ~ms; must cache)."""
+    buf = _HS_BUFS.get(key)
+    if buf is None or buf.numel() < nbytes:
+        buf = torch.empty(max(nbytes, 1 << 20),
+                          dtype=torch.uint8,
+                          pin_memory=True)
+        _HS_BUFS[key] = buf
+    return buf
+
 
 class AgRsAll2AllManager(All2AllManagerBase):
     """
@@ -124,6 +148,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
+        if (_HOSTSTAGED_EP and extra_tensors is None
+                and not is_sequence_parallel and self.dp_world_size > 1):
+            outs = self._host_staged_ag(tensors_to_gather, sizes,
+                                        hidden_states.device)
+            return outs[0], outs[1], outs[2]
+
         if _FUSED_DISPATCH and extra_tensors is None:
             # Byte-level fusion: the 3-tensor list all_gatherv loops one
             # collective per tensor, paying full collective latency 3x per
@@ -175,8 +205,118 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
+        if (_HOSTSTAGED_EP and not is_sequence_parallel
+                and self.dp_world_size > 1):
+            return self._host_staged_rs(hidden_states, sizes, dist_group)
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
         return hidden_states
+
+    def _host_staged_ag(self, tensors_to_gather, sizes, device):
+        """all_gatherv via pinned staging + gloo all_gather on the DP gloo twin.
+
+        Per-rank row counts differ, so each rank pads its payload to
+        max(sizes) rows; the gather output is sliced back to the true sizes.
+        """
+        import torch.distributed as dist
+
+        from vllm.distributed.parallel_state import get_dp_group
+
+        cpg = get_dp_group().cpu_group
+        n = len(sizes)
+        max_sz = max(sizes)
+        total = sum(sizes)
+
+        flats, meta = [], []
+        for t in tensors_to_gather:
+            t = t.contiguous()
+            b = t.view(torch.uint8).view(t.shape[0], -1)
+            flats.append(b)
+            meta.append((t.shape, t.dtype, b.shape[1]))
+        W = flats[0].shape[1] + sum(f.shape[1] for f in flats[1:])
+
+        if total == 0:
+            return [
+                torch.empty(0, *shape[1:], dtype=dtype, device=device)
+                for shape, dtype, _ in meta
+            ]
+
+        packed = torch.cat(flats, dim=1)
+        if packed.shape[0] < max_sz:
+            packed = torch.cat(
+                [packed, packed.new_zeros(max_sz - packed.shape[0], W)], dim=0)
+
+        xb = _hs_pin("disp_in", max_sz * W)[:max_sz * W].view(max_sz, W)
+        xb.copy_(packed, non_blocking=True)
+        torch.cuda.current_stream(device).synchronize()
+
+        ob = _hs_pin("disp_out", n * max_sz * W)
+        outs = [
+            ob[i * max_sz * W:(i + 1) * max_sz * W].view(max_sz, W)
+            for i in range(n)
+        ]
+        dist.all_gather(outs, xb, group=cpg)
+
+        if total < n * max_sz:
+            gathered_cpu = torch.cat([outs[i][:sizes[i]] for i in range(n)])
+        else:
+            gathered_cpu = ob[:total * W].view(total, W)
+        gathered = gathered_cpu.to(device, non_blocking=True)
+
+        res = []
+        off = 0
+        for shape, dtype, nbytes in meta:
+            part = gathered[:, off:off + nbytes].contiguous().view(dtype)
+            res.append(part.view(total, *shape[1:]))
+            off += nbytes
+        return res
+
+    def _host_staged_rs(self, hidden_states, sizes, dist_group):
+        """reduce_scatterv via pinned staging + gloo all_reduce + own-slice.
+
+        Every rank's input already has sum(sizes) rows (set by dispatch), so
+        no padding is needed; RS == all_reduce + take own row-slice.
+        """
+        global _HS_BF16_OK
+        import torch.distributed as dist
+
+        from vllm.distributed.parallel_state import get_dp_group
+
+        cpg = get_dp_group().cpu_group
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        total, H = hidden_states.shape
+        rank = dist_group.rank_in_group
+        off = sum(sizes[:rank])
+        rows = sizes[rank]
+
+        if _HS_BF16_OK is None:
+            try:
+                probe = torch.zeros(1, dtype=torch.bfloat16)
+                dist.all_reduce(probe, group=cpg)
+                _HS_BF16_OK = True
+            except RuntimeError:
+                _HS_BF16_OK = False
+            logger.info("K3 host-staged EP: gloo bf16 all_reduce=%s",
+                        "ok" if _HS_BF16_OK else "unsupported, fp32 upcast")
+
+        if dtype == torch.bfloat16 and not _HS_BF16_OK:
+            staged = hidden_states.float()
+            sdt = torch.float32
+        else:
+            staged = hidden_states
+            sdt = dtype
+        esz = staged.element_size()
+
+        xb = _hs_pin("comb_in",
+                     total * H * esz)[:total * H * esz].view(sdt).view(
+                         total, H)
+        xb.copy_(staged, non_blocking=True)
+        torch.cuda.current_stream(device).synchronize()
+        dist.all_reduce(xb, group=cpg)
+        out = xb[off:off + rows]
+        if sdt != dtype:
+            out = out.to(dtype)
+        return out.to(device, non_blocking=True)
 
     def destroy(self):
         pass
