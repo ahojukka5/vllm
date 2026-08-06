@@ -133,6 +133,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
+        # K3: direct gate visibility — the 'tp:0' group silently ended up
+        # PYNCCL-only in xbnd3d despite all standalone gates passing (cadiag).
+        if "tp" in unique_name:
+            logger.info(
+                "K3-CA-GATE unique=%s use_custom=%s aiter=%s ca=%s",
+                unique_name,
+                use_custom_allreduce,
+                self.aiter_ar_comm is not None,
+                (self.ca_comm is not None and not self.ca_comm.disabled),
+            )
+
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 

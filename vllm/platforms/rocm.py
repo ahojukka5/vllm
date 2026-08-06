@@ -982,9 +982,12 @@ class RocmPlatform(Platform):
         # extension (k3-customar build-glm, GLM-campaign header) is
         # probe-validated bf16 bit-exact and 2.5-3.5x faster than RCCL for
         # K3's TP all-reduce sizes on 8xMI250X. Upstream keeps CustomAR
-        # MI300-only, so this stays env-gated.
-        return (os.environ.get("VLLM_ROCM_GFX90A_CUSTOM_AR", "0") == "1"
-                and "gfx90a" in _GCN_ARCH)
+        # MI300-only, so this stays env-gated. NOTE: _GCN_ARCH is computed
+        # at module import; in Ray worker processes that is before CUDA
+        # init, so it can be empty there — do not condition the opt-in on
+        # it (xbnd3d: gate silently False in workers). CustomAllreduce
+        # self-disables if P2P/topology init fails (GLM-campaign note).
+        return os.environ.get("VLLM_ROCM_GFX90A_CUSTOM_AR", "0") == "1"
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
