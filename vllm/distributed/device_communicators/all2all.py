@@ -552,13 +552,21 @@ class AgRsAll2AllManager(All2AllManagerBase):
                 dim=0)
 
         epf = self._epfa_group()
-        pid = _EPFA_SEQ % 2
-        globals()["_EPFA_SEQ"] = _EPFA_SEQ + 1
+        stream = torch.cuda.current_stream(device)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing:
+            # Fixed pair 0 in graphs: A/B rotation would make the wire
+            # tag (derived from the slot) depend on the LOCAL call parity,
+            # which diverges across ranks (different dummy-run/prefill
+            # histories) and mismatches peers' recvs. Graphs are fully
+            # stream-serial anyway, so rotation buys nothing.
+            pid = 0
+        else:
+            pid = _EPFA_SEQ % 2
+            globals()["_EPFA_SEQ"] = _EPFA_SEQ + 1
         sbuf, rbuf = epf.pair(pid, max_sz * W, n * max_sz * W)
         xb = sbuf[:max_sz * W].view(max_sz, W)
 
-        stream = torch.cuda.current_stream(device)
-        capturing = torch.cuda.is_current_stream_capturing()
         if not capturing:
             # rbuf[pid] was last read by the H2D of the call before the
             # previous one (A/B alternation) — that event long completed.
@@ -618,14 +626,19 @@ class AgRsAll2AllManager(All2AllManagerBase):
             return hidden_states
 
         epf = self._epfa_group()
-        pid = 2 + (_EPFA_CSEQ % 2)
-        globals()["_EPFA_CSEQ"] = _EPFA_CSEQ + 1
+        stream = torch.cuda.current_stream(device)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing:
+            # Fixed pair 2 in graphs — see dispatch for why rotation is
+            # capture-unsafe (cross-rank tag misalignment).
+            pid = 2
+        else:
+            pid = 2 + (_EPFA_CSEQ % 2)
+            globals()["_EPFA_CSEQ"] = _EPFA_CSEQ + 1
         sbuf, rbuf = epf.pair(pid, total * H * 2,
                               dist_group.world_size * total * H * 2)
         xb = sbuf[:total * H * 2].view(torch.bfloat16).view(total, H)
 
-        stream = torch.cuda.current_stream(device)
-        capturing = torch.cuda.is_current_stream_capturing()
         if not capturing:
             ev = _HS_BUFS.get(f"epfa_comb_ev{pid}")
             if ev is not None:
