@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
@@ -24,6 +27,25 @@ from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+# K3 gfx90a: raw pynccl collectives spin inside the HIP/HSA runtime when
+# recorded under CUDA graph stream capture on ROCm 6.4 (xbndg3 py-spy:
+# ncclReduceScatter wedged in libhsa during FULL_DECODE_ONLY capture).
+# torch.distributed's ProcessGroupNCCL path captures cleanly cross-node
+# (cap2_probe, 2026-08-07). Route uniform in-capture AG/RS through torch
+# when VLLM_K3_TORCH_NCCL_IN_CAPTURE=1.
+_TORCH_NCCL_IN_CAPTURE: bool | None = None
+
+
+def _torch_nccl_in_capture() -> bool:
+    global _TORCH_NCCL_IN_CAPTURE
+    if _TORCH_NCCL_IN_CAPTURE is None:
+        _TORCH_NCCL_IN_CAPTURE = os.environ.get(
+            "VLLM_K3_TORCH_NCCL_IN_CAPTURE", "0") == "1"
+        if _TORCH_NCCL_IN_CAPTURE:
+            logger.info("K3: torch.distributed route for in-capture "
+                        "AG/RS collectives enabled")
+    return _TORCH_NCCL_IN_CAPTURE and torch.cuda.is_current_stream_capturing()
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -461,6 +483,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             if sizes is not None and sizes.count(sizes[0]) != len(sizes):
                 pynccl_comm.reduce_scatterv(output, input_tensor, sizes=sizes)
+            elif _torch_nccl_in_capture():
+                dist.reduce_scatter_tensor(output, input_tensor,
+                                           group=self.device_group)
             else:
                 pynccl_comm.reduce_scatter(output, input_tensor)
 
@@ -653,6 +678,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             if sizes is not None:
                 pynccl_comm.all_gatherv(output_tensor, input_, sizes=sizes)
+            elif _torch_nccl_in_capture():
+                dist.all_gather_into_tensor(output_tensor, input_,
+                                            group=self.device_group)
             else:
                 pynccl_comm.all_gather(output_tensor, input_)
             return output_tensor
