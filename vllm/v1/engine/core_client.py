@@ -559,33 +559,28 @@ class MPClient(EngineCoreClient):
                 # between (recurring EADDRINUSE flakes on LUMI dev-g). The
                 # bound endpoint is reported back over actual_address_pipe,
                 # so re-binding on a kernel-assigned port is transparent.
-                for _bind_attempt in range(5):
-                    try:
-                        self.input_socket = self.resources.input_socket = (
-                            make_zmq_socket(
-                                self.ctx,
-                                input_address,
-                                zmq.ROUTER,
-                                bind=True,
-                                router_handover=enable_input_socket_handover,
-                            )
-                        )
-                        break
-                    except zmq.ZMQError as bind_err:
-                        if (
-                            bind_err.errno != errno.EADDRINUSE
-                            or _bind_attempt == 4
-                            or not input_address.startswith("tcp://")
-                        ):
-                            raise
-                        logger.warning(
-                            "ZMQ bind %s failed (EADDRINUSE), retrying on a "
-                            "kernel-assigned port", input_address)
-                        input_address = (input_address.rsplit(":", 1)[0]
-                                         + ":0")
-                self.resources.output_socket = make_zmq_socket(
-                    self.ctx, output_address, zmq.PULL
-                )
+                def _bind_eaddrinuse_retry(address, sock_type, **kwargs):
+                    for attempt in range(5):
+                        try:
+                            return make_zmq_socket(
+                                self.ctx, address, sock_type, bind=True,
+                                **kwargs), address
+                        except zmq.ZMQError as bind_err:
+                            if (bind_err.errno != errno.EADDRINUSE
+                                    or attempt == 4
+                                    or not address.startswith("tcp://")):
+                                raise
+                            logger.warning(
+                                "ZMQ bind %s failed (EADDRINUSE), retrying "
+                                "on a kernel-assigned port", address)
+                            address = address.rsplit(":", 1)[0] + ":0"
+
+                self.input_socket, input_address = _bind_eaddrinuse_retry(
+                    input_address, zmq.ROUTER,
+                    router_handover=enable_input_socket_handover)
+                self.resources.input_socket = self.input_socket
+                self.resources.output_socket, output_address = (
+                    _bind_eaddrinuse_retry(output_address, zmq.PULL))
 
                 # Report bound endpoints back so the parent can forward
                 # them to engines (mirrors the DPCoordinator pattern).
