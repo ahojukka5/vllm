@@ -185,7 +185,8 @@ class _EpFabricAsync:
 
     _inst: "_EpFabricAsync | None" = None
 
-    def __init__(self, cpu_group, rank_in_group: int, world: int):
+    def __init__(self, cpu_group, rank_in_group: int, world: int,
+                 device_index: int = 0):
         import ctypes
 
         import torch.distributed as dist
@@ -197,6 +198,7 @@ class _EpFabricAsync:
         )
         lib = ctypes.CDLL(so)
         lib.epf_open.restype = int
+        lib.epf_open.argtypes = [ctypes.c_int]
         lib.epf_getname.restype = int
         lib.epf_getname.argtypes = [ctypes.c_void_p,
                                     ctypes.POINTER(ctypes.c_size_t)]
@@ -221,7 +223,7 @@ class _EpFabricAsync:
         self.pairs = {}  # id -> (sbuf tensor, rbuf tensor)
         self.slot = 0
 
-        if lib.epf_open() != 0:
+        if lib.epf_open(device_index) != 0:
             raise RuntimeError("epfabric_async: epf_open failed")
         name = bytes(64)
         n = ctypes.c_size_t(64)
@@ -243,10 +245,11 @@ class _EpFabricAsync:
             "spin-wait)", world, rank_in_group)
 
     @classmethod
-    def get(cls, cpu_group, rank_in_group: int,
-            world: int) -> "_EpFabricAsync":
+    def get(cls, cpu_group, rank_in_group: int, world: int,
+            device_index: int = 0) -> "_EpFabricAsync":
         if cls._inst is None:
-            cls._inst = _EpFabricAsync(cpu_group, rank_in_group, world)
+            cls._inst = _EpFabricAsync(cpu_group, rank_in_group, world,
+                                       device_index)
         return cls._inst
 
     def pair(self, pid: int, scap: int, rcap: int):
@@ -265,8 +268,10 @@ class _EpFabricAsync:
     def submit(self, op: int, count: int, stream_handle: int, pid: int):
         """Record the producer event, enqueue the job, enqueue the GPU
         spin-wait on the compute stream. Returns the flag value."""
-        self.slot = (self.slot + 1) % 64
-        if self.lib.epf_record(self.slot, stream_handle) != 0:
+        # lib assigns a unique event slot tied to its job sequence
+        # (pool 256 > queue depth 128 -> no live slot reuse)
+        self.slot = self.lib.epf_record(-1, stream_handle)
+        if self.slot < 0:
             raise RuntimeError("epfabric_async: epf_record failed")
         val = self.lib.epf_submit(op, count, self.slot, pid)
         if val == 0:
@@ -466,8 +471,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
         from vllm.distributed.parallel_state import get_dp_group
 
         dpg = get_dp_group()
+        dev_idx = torch.cuda.current_device()
         return _EpFabricAsync.get(dpg.cpu_group, dpg.rank_in_group,
-                                  dpg.world_size)
+                                  dpg.world_size, dev_idx)
 
     def _epfa_ag(self, tensors_to_gather, sizes, device):
         """Async staged all_gatherv: enqueue-only, no CPU blocking.
