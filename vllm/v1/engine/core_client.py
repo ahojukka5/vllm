@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import errno
 import queue
 import sys
 import uuid
@@ -551,13 +552,37 @@ class MPClient(EngineCoreClient):
                 self.stats_update_address = client_addresses.get("stats_update_address")
                 # Tensor queues passed via client_addresses for multi-API-server case
                 tensor_queue = client_addresses.get("tensor_queue")
-                self.input_socket = self.resources.input_socket = make_zmq_socket(
-                    self.ctx,
-                    input_address,
-                    zmq.ROUTER,
-                    bind=True,
-                    router_handover=enable_input_socket_handover,
-                )
+                # Ray-DP pre-picks API-server ports with get_open_port()
+                # (defer_api_server_ports=False in serve.py), so the port is
+                # checked free at launch but only bound by this child process
+                # much later — on a shared node another tenant can grab it in
+                # between (recurring EADDRINUSE flakes on LUMI dev-g). The
+                # bound endpoint is reported back over actual_address_pipe,
+                # so re-binding on a kernel-assigned port is transparent.
+                for _bind_attempt in range(5):
+                    try:
+                        self.input_socket = self.resources.input_socket = (
+                            make_zmq_socket(
+                                self.ctx,
+                                input_address,
+                                zmq.ROUTER,
+                                bind=True,
+                                router_handover=enable_input_socket_handover,
+                            )
+                        )
+                        break
+                    except zmq.ZMQError as bind_err:
+                        if (
+                            bind_err.errno != errno.EADDRINUSE
+                            or _bind_attempt == 4
+                            or not input_address.startswith("tcp://")
+                        ):
+                            raise
+                        logger.warning(
+                            "ZMQ bind %s failed (EADDRINUSE), retrying on a "
+                            "kernel-assigned port", input_address)
+                        input_address = (input_address.rsplit(":", 1)[0]
+                                         + ":0")
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx, output_address, zmq.PULL
                 )
