@@ -416,6 +416,14 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                if os.environ.get("K3_CUSTOM_AR_COPY_PATH", "1") == "1":
+                    # Copy path under capture: registered=True would run
+                    # zero-copy through the graph-buffer registration we
+                    # skipped (see capture() finally) -> captured kernel
+                    # reads null peer pointers -> 0x1000 at replay
+                    # (xbndg7/9/10/11). The copy path uses the internal
+                    # buffer registered at init — replay-stable.
+                    return self.all_reduce(input, registered=False)
                 return self.all_reduce(input, registered=True)
             else:
                 # If warm up, mimic the allocation pattern since custom
