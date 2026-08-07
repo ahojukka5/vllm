@@ -250,17 +250,25 @@ class CustomAllreduce {
     RankData* ptrs;
     cudaStreamCaptureStatus status;
     CUDACHECK(cudaStreamIsCapturing(stream, &status));
-    if (status == cudaStreamCaptureStatusActive) {
+    // Pre-registered buffers (e.g. the internal copy-path buffer registered
+    // at init) resolve through buffers_ even under stream capture. Taking
+    // the deferred graph_unreg_buffers_ slot for them only works if
+    // register_graph_buffers() runs after capture; deployments that skip it
+    // (e.g. ROCm/gfx90a, where zero-copy IPC of caching-allocator tensors
+    // resolves wrong peer addresses) would otherwise leave the captured
+    // kernel reading never-initialized RankData -> null peer pointers ->
+    // memory fault at replay.
+    auto it = buffers_.find(input);
+    if (it != buffers_.end()) {
+      ptrs = it->second;
+    } else if (status == cudaStreamCaptureStatusActive) {
       ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
       graph_unreg_buffers_.push_back(input);
     } else {
-      auto it = buffers_.find(input);
-      if (it == buffers_.end())
-        throw std::runtime_error(
-            "buffer address " +
-            std::to_string(reinterpret_cast<uint64_t>(input)) +
-            " is not registered!");
-      ptrs = it->second;
+      throw std::runtime_error(
+          "buffer address " +
+          std::to_string(reinterpret_cast<uint64_t>(input)) +
+          " is not registered!");
     }
 
     size /= d;
