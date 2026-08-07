@@ -32,8 +32,11 @@ logger = init_logger(__name__)
 # recorded under CUDA graph stream capture on ROCm 6.4 (xbndg3 py-spy:
 # ncclReduceScatter wedged in libhsa during FULL_DECODE_ONLY capture).
 # torch.distributed's ProcessGroupNCCL path captures cleanly cross-node
-# (cap2_probe, 2026-08-07). Route uniform in-capture AG/RS through torch
-# when VLLM_K3_TORCH_NCCL_IN_CAPTURE=1.
+# (cap2_probe, 2026-08-07). Route uniform AG/RS through torch when
+# VLLM_K3_TORCH_NCCL_IN_CAPTURE=1. NOTE: the route is taken in eager
+# mode too — a capture-only gate would defer the torch communicator's
+# lazy ncclCommInitRank into the first capture, where RCCL init calls
+# hipFree and invalidates capture (xbndg5, rccl init.cc:2201).
 _TORCH_NCCL_IN_CAPTURE: bool | None = None
 
 
@@ -43,9 +46,9 @@ def _torch_nccl_in_capture() -> bool:
         _TORCH_NCCL_IN_CAPTURE = os.environ.get(
             "VLLM_K3_TORCH_NCCL_IN_CAPTURE", "0") == "1"
         if _TORCH_NCCL_IN_CAPTURE:
-            logger.info("K3: torch.distributed route for in-capture "
-                        "AG/RS collectives enabled")
-    return _TORCH_NCCL_IN_CAPTURE and torch.cuda.is_current_stream_capturing()
+            logger.info("K3: torch.distributed route for AG/RS "
+                        "collectives enabled (capture-safe)")
+    return _TORCH_NCCL_IN_CAPTURE
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
