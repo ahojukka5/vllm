@@ -44,6 +44,11 @@ logger = init_logger(__name__)
 
 _FUSED_DISPATCH = os.environ.get("VLLM_K3_FUSED_DISPATCH", "0") == "1"
 
+# Replay-bisection switch (VLLM_K3_SKIP_EP=1): dispatch/combine become
+# local no-ops so FULL-graph capture contains zero EP collectives.
+# Numerically wrong; used ONLY to localize the 0x1000 replay fault.
+_SKIP_EP = os.environ.get("VLLM_K3_SKIP_EP", "0") == "1"
+
 # Host-staged EP dispatch/combine: route the DP-group all_gatherv /
 # reduce_scatterv through pinned CPU buffers + gloo (TCP over hsn) instead of
 # RCCL. On LUMI MI250X, RCCL cross-node pays ~370us/hop staged through
@@ -378,6 +383,13 @@ class AgRsAll2AllManager(All2AllManagerBase):
         """
         Gather hidden_states and router_logits from all dp ranks.
         """
+        if (_SKIP_EP and extra_tensors is None
+                and not is_sequence_parallel and self.dp_world_size > 1):
+            # Capture/replay bisection: skip the EP all-gather entirely
+            # (local tokens only). Numerically WRONG — replay-survival
+            # probe only (VLLM_K3_SKIP_EP=1, 0x1000 fault locus hunt).
+            return hidden_states, topk_weights, topk_ids
+
         dist_group = self._get_comm_group(is_sequence_parallel)
         sizes = self._get_sizes(hidden_states.shape[0], dist_group)
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
@@ -450,6 +462,13 @@ class AgRsAll2AllManager(All2AllManagerBase):
         """
         Reduce-scatter hidden_states across all dp ranks.
         """
+        if (_SKIP_EP and not is_sequence_parallel
+                and self.dp_world_size > 1):
+            # Bisection pair for the dispatch skip: hidden_states is
+            # already the local shard — return as-is. WRONG numerics,
+            # replay-survival probe only (VLLM_K3_SKIP_EP=1).
+            return hidden_states
+
         dist_group = self._get_comm_group(is_sequence_parallel)
         sizes = self._get_sizes(
             hidden_states.shape[0] // dist_group.world_size,
