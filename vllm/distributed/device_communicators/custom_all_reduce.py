@@ -342,7 +342,18 @@ class CustomAllreduce:
             yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
+            # K3 gfx90a: zero-copy IPC registration of caching-allocator
+            # tensors resolves WRONG peer addresses under CUDA graph capture
+            # on ROCm (GLM-4.7 campaign, same hardware). Skipping
+            # register_graph_buffers forces in-graph ARs onto the
+            # pre-registered internal-buffer copy path — capture-safe and
+            # proven correct+fast on MI250X (their customar2, +23% conc-1).
+            if not self.disabled and os.environ.get(
+                    "K3_CUSTOM_AR_COPY_PATH", "1") == "1":
+                logger.info(
+                    "K3-CA: skipping graph-buffer IPC registration "
+                    "(ROCm copy-path fix)")
+            elif not self.disabled:
                 self.register_graph_buffers()
 
     def register_graph_buffers(self):
