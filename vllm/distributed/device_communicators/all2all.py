@@ -221,6 +221,11 @@ class _EpFabricAsync:
                                    ctypes.c_int, ctypes.c_int]
         lib.epf_launch_wait.restype = int
         lib.epf_launch_wait.argtypes = [ctypes.c_uint64, ctypes.c_uint]
+        lib.epf_gr_launch.restype = int
+        lib.epf_gr_launch.argtypes = [ctypes.c_uint64, ctypes.c_int,
+                                      ctypes.c_uint]
+        lib.epf_gr_debug.restype = ctypes.c_uint
+        lib.epf_gr_debug.argtypes = [ctypes.c_int, ctypes.c_int]
         lib.epf_start_worker.restype = int
         self.lib = lib
         self.world = world
@@ -259,6 +264,14 @@ class _EpFabricAsync:
 
     def pair(self, pid: int, scap: int, rcap: int):
         """Return (sbuf, rbuf) for pair id, (re)registering on grow."""
+        cur = self.pairs.get(pid)
+        if (cur is not None
+                and (cur[0].numel() < scap or cur[1].numel() < rcap)
+                and torch.cuda.is_current_stream_capturing()):
+            # Growing swaps the pinned tensors; graphs captured earlier
+            # still reference the old pair and would silently corrupt.
+            raise RuntimeError(
+                "epfabric_async: pair grow during graph capture")
         sbuf = _hs_pin(f"epfa_s{pid}", scap)
         rbuf = _hs_pin(f"epfa_r{pid}", rcap)
         cur = self.pairs.get(pid)
@@ -284,6 +297,18 @@ class _EpFabricAsync:
         if self.lib.epf_launch_wait(stream_handle, val) != 0:
             raise RuntimeError("epfabric_async: epf_launch_wait failed")
         return val
+
+    def graph_submit(self, count: int, stream_handle: int, pid: int):
+        """Capture-safe variant: launch the fused doorbell+wait kernel.
+
+        The kernel rings the worker through host-mapped memory and spins
+        on the completion flag, so the whole EP round-trip is recorded
+        into a CUDA graph and re-executes at replay with zero host-side
+        work. `count` is baked into the recorded launch (static per
+        captured batch size).
+        """
+        if self.lib.epf_gr_launch(stream_handle, pid, count) != 0:
+            raise RuntimeError("epfabric_async: epf_gr_launch failed")
 
 
 # Timing instrumentation for the epfabric path (xbnd7: engaged but 15%
@@ -533,14 +558,20 @@ class AgRsAll2AllManager(All2AllManagerBase):
         xb = sbuf[:max_sz * W].view(max_sz, W)
 
         stream = torch.cuda.current_stream(device)
-        # rbuf[pid] was last read by the H2D of the call before the
-        # previous one (A/B alternation) — that event long completed.
-        ev = _HS_BUFS.get(f"epfa_disp_ev{pid}")
-        if ev is not None:
-            ev.synchronize()
+        capturing = torch.cuda.is_current_stream_capturing()
+        if not capturing:
+            # rbuf[pid] was last read by the H2D of the call before the
+            # previous one (A/B alternation) — that event long completed.
+            # (Under capture, stream order alone serializes everything.)
+            ev = _HS_BUFS.get(f"epfa_disp_ev{pid}")
+            if ev is not None:
+                ev.synchronize()
 
         xb.copy_(packed, non_blocking=True)
-        epf.submit(0, max_sz * W, stream.cuda_stream, pid)
+        if capturing:
+            epf.graph_submit(max_sz * W, stream.cuda_stream, pid)
+        else:
+            epf.submit(0, max_sz * W, stream.cuda_stream, pid)
 
         # The H2D copyout must be stream-ordered after the spin kernel;
         # any CPU-side read of rbuf here (e.g. a CPU torch.cat of the
@@ -550,9 +581,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
                              device=device)
         padded.copy_(rbuf[:n * max_sz * W].view(n * max_sz, W),
                      non_blocking=True)
-        ev = torch.cuda.Event()
-        ev.record(stream)
-        _HS_BUFS[f"epfa_disp_ev{pid}"] = ev
+        if not capturing:
+            # hipEventRecord is capture-unsafe on this ROCm stack
+            # (hipErrorCapturedEvent); only needed for eager A/B guards.
+            ev = torch.cuda.Event()
+            ev.record(stream)
+            _HS_BUFS[f"epfa_disp_ev{pid}"] = ev
 
         if total < n * max_sz:
             gathered = torch.cat(
@@ -591,19 +625,25 @@ class AgRsAll2AllManager(All2AllManagerBase):
         xb = sbuf[:total * H * 2].view(torch.bfloat16).view(total, H)
 
         stream = torch.cuda.current_stream(device)
-        ev = _HS_BUFS.get(f"epfa_comb_ev{pid}")
-        if ev is not None:
-            ev.synchronize()
+        capturing = torch.cuda.is_current_stream_capturing()
+        if not capturing:
+            ev = _HS_BUFS.get(f"epfa_comb_ev{pid}")
+            if ev is not None:
+                ev.synchronize()
 
         xb.copy_(hidden_states, non_blocking=True)
-        epf.submit(1, total * H, stream.cuda_stream, pid)
+        if capturing:
+            epf.graph_submit(total * H, stream.cuda_stream, pid)
+        else:
+            epf.submit(1, total * H, stream.cuda_stream, pid)
 
         src = rbuf[:total * H * 2].view(torch.bfloat16).view(total, H)
         res = torch.empty(rows, H, dtype=dtype, device=device)
         res.copy_(src[off:off + rows], non_blocking=True)
-        ev = torch.cuda.Event()
-        ev.record(stream)
-        _HS_BUFS[f"epfa_comb_ev{pid}"] = ev
+        if not capturing:
+            ev = torch.cuda.Event()
+            ev.record(stream)
+            _HS_BUFS[f"epfa_comb_ev{pid}"] = ev
         return res
 
     def _epf_group(self):
