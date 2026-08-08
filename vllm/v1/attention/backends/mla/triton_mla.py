@@ -13,6 +13,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
+    QueryLenSupport,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -48,20 +49,16 @@ def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
 
 
 class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
-    # Non-causal DSpark block is flattened to one decode row per query token in
-    # forward_mqa, so no intra-block causal masking is required.
+    # Uniform multi-token query blocks (spec-decode verify, DSpark drafts) are
+    # flattened to one decode row per query token in forward_mqa; causal blocks
+    # get staggered per-row seq_lens, so no kernel-side masking is required and
+    # full-cudagraph capture admits spec decode.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        # Only the non-causal DSpark draft group serves multi-token blocks via
-        # the decode path; raise its reorder threshold to the spec block length
-        # so full-cudagraph capture admits it. Causal usage stays single-token.
-        if getattr(self, "non_causal_multi_token_decode", False):
-            self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         self._reserve_attn_logits_workspace()
 
     def _reserve_attn_logits_workspace(self) -> None:
@@ -74,11 +71,10 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         """
         if not is_workspace_manager_initialized():
             return
-        # Decode reorder threshold is 1, so decode tokens <= max_num_seqs.
+        # Decode reorder threshold is 1 for plain decode; multi-token query
+        # blocks (spec verify, DSpark drafts) flatten to query_len decode rows.
         B = self.vllm_config.scheduler_config.max_num_seqs
-        # Non-causal DSpark draft flattens each request's block to query_len
-        # decode rows; cover max_num_seqs * block_len rows.
-        if getattr(self, "non_causal_multi_token_decode", False):
+        if self.reorder_batch_threshold is not None:
             B *= self.reorder_batch_threshold
         # DCP all-gathers the query heads before forward_mqa.
         q_num_heads = self.num_heads * self.dcp_world_size
@@ -285,15 +281,23 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         block_table = attn_metadata.decode.block_table
         seq_lens = attn_metadata.decode.seq_lens
-        if not attn_metadata.causal:
-            # Non-causal DSpark block: flatten to one decode row per query token.
-            # Each row attends to the same committed KV prefix (per-row seq_lens)
-            # and never to sibling block tokens = non-causal block semantics.
-            # Mirrors FlashInferMLA's non-causal path.
-            query_len = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
-            if query_len > 1:
-                block_table = block_table.repeat_interleave(query_len, dim=0)
-                seq_lens = seq_lens.repeat_interleave(query_len)
+        query_len = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
+        if query_len > 1:
+            # Uniform multi-token query block: flatten to one decode row per
+            # query token. All block tokens are already in the KV cache when
+            # attention runs, so causal semantics reduce to staggered per-row
+            # seq_lens: row i of a request at total seq_len S attends to
+            # S - (query_len - 1 - i) tokens (its own token last). Non-causal
+            # DSpark blocks keep the full S for every row instead.
+            block_table = block_table.repeat_interleave(query_len, dim=0)
+            seq_lens = seq_lens.repeat_interleave(query_len)
+            if attn_metadata.causal:
+                stagger = torch.arange(
+                    query_len - 1, -1, -1, dtype=seq_lens.dtype, device=q.device
+                )
+                # clamp: padded capture rows may have seq_len < query_len.
+                stagger = stagger.repeat(attn_metadata.num_decodes)
+                seq_lens = (seq_lens - stagger).clamp_(min=1)
 
         # Run MQA — always pass layer scales. When KV cache is
         # BF16 the kernel's `if dtype.is_fp8()` check is a no-op.
