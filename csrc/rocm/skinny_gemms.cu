@@ -344,6 +344,52 @@ __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
   return min(a, b);
 }
 
+// Wavefront-wide f32 reduction leaving the total in the last lane.
+//
+// On gfx90a the __builtin_amdgcn_mov_dpp form is miscompiled by ROCm <= 6.4
+// LLVM: the DPP-combine pass folds the mov_dpp into an unrelated adjacent
+// instruction (observed v_cvt_f32_i32_dpp in place of the add+mov pair),
+// producing garbage for every shape. Use explicit DPP asm there instead
+// (this is the pre-#33762 formulation, correct on all ROCm versions).
+// See https://github.com/vllm-project/vllm/pull/38914 for the earlier
+// MI250X report that AMD could not reproduce on ROCm 7.2.
+#if defined(__gfx90a__)
+  #define WVSPLITK_WF_REDUCE(acc)                                       \
+    asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:8 bound_ctrl:0 "       \
+        : "=v"(acc)                                                     \
+        : "0"(acc), "v"(acc), "v"(acc));                                \
+    asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:4 bound_ctrl:0 "       \
+        : "=v"(acc)                                                     \
+        : "0"(acc), "v"(acc), "v"(acc));                                \
+    asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:2 bound_ctrl:0 "       \
+        : "=v"(acc)                                                     \
+        : "0"(acc), "v"(acc), "v"(acc));                                \
+    asm("s_nop 0\n\tv_add_f32 %0, %2, %3 wave_shr:1 bound_ctrl:0"       \
+        : "=v"(acc)                                                     \
+        : "0"(acc), "v"(acc), "v"(acc));                                \
+    asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 row_mask:0xa "    \
+        : "=v"(acc)                                                     \
+        : "0"(acc), "v"(acc), "v"(acc));                                \
+    asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 row_mask:0xc "    \
+        : "=v"(acc)                                                     \
+        : "0"(acc), "v"(acc), "v"(acc));
+#elif defined(__HIP__GFX9__)
+  #define WVSPLITK_WF_REDUCE(acc)                                     \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x118, 0xf, 0xf, 1);         \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x114, 0xf, 0xf, 1);         \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x112, 0xf, 0xf, 1);         \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x111, 0xf, 0xf, 1);         \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x142, 0xf, 0xf, 1);         \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x143, 0xf, 0xf, 1);
+#else
+  #define WVSPLITK_WF_REDUCE(acc)                             \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x118, 0xf, 0xf, 1); \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x114, 0xf, 0xf, 1); \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x112, 0xf, 0xf, 1); \
+    acc += __builtin_amdgcn_mov_dpp(acc, 0x111, 0xf, 0xf, 1); \
+    acc += __shfl_xor(acc, 16);
+#endif
+
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 // This version targets cases where A[] fits LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
@@ -478,22 +524,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     if constexpr (!use_mfma) {
       for (int n = 0; n < N; n++) {
         for (int y = 0; y < YTILE; y++) {
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x118, 0xf, 0xf,
-                                                1);  // row_shr8
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x114, 0xf, 0xf,
-                                                1);  // row_shr4
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x112, 0xf, 0xf,
-                                                1);  // row_shr2
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x111, 0xf, 0xf,
-                                                1);  // row_shr1
-  #if defined(__HIP__GFX9__)
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x142, 0xf, 0xf,
-                                                1);  // ROW_BCAST15
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x143, 0xf, 0xf,
-                                                1);  // ROW_BCAST31
-  #else
-          sum[n][y] += __shfl_xor(sum[n][y], 16);
-  #endif
+          WVSPLITK_WF_REDUCE(sum[n][y])
         }
       }
 
@@ -699,22 +730,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     if constexpr (!use_mfma) {
       for (int n = 0; n < N; n++) {
         for (int y = 0; y < YTILE; y++) {
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x118, 0xf, 0xf,
-                                                1);  // row_shr8
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x114, 0xf, 0xf,
-                                                1);  // row_shr4
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x112, 0xf, 0xf,
-                                                1);  // row_shr2
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x111, 0xf, 0xf,
-                                                1);  // row_shr1
-  #if defined(__HIP__GFX9__)
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x142, 0xf, 0xf,
-                                                1);  // ROW_BCAST15
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x143, 0xf, 0xf,
-                                                1);  // ROW_BCAST31
-  #else
-          sum[n][y] += __shfl_xor(sum[n][y], 16);
-  #endif
+          WVSPLITK_WF_REDUCE(sum[n][y])
         }
       }
 
@@ -1052,22 +1068,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     if constexpr (!use_mfma) {
       for (int n = 0; n < N; n++) {
         for (int y = 0; y < YTILE; y++) {
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x118, 0xf, 0xf,
-                                                1);  // row_shr8
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x114, 0xf, 0xf,
-                                                1);  // row_shr4
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x112, 0xf, 0xf,
-                                                1);  // row_shr2
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x111, 0xf, 0xf,
-                                                1);  // row_shr1
-  #if defined(__HIP__GFX9__)
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x142, 0xf, 0xf,
-                                                1);  // ROW_BCAST15
-          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x143, 0xf, 0xf,
-                                                1);  // ROW_BCAST31
-  #else
-          sum[n][y] += __shfl_xor(sum[n][y], 16);
-  #endif
+          WVSPLITK_WF_REDUCE(sum[n][y])
         }
       }
 
