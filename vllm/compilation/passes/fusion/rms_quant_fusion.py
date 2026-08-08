@@ -153,8 +153,13 @@ class RMSNormQuantPattern:
         config = get_current_vllm_config()
         self.model_dtype = config.model_config.dtype if config.model_config else None
 
-        assert key in FUSED_OPS, f"unsupported fused rmsnorm+quant op for {key}"
-        self.FUSED_OP = FUSED_OPS[key]
+        # Ops may be missing on builds without the fused custom kernels
+        # (e.g. custom ops disabled): register() then becomes a no-op.
+        self.FUSED_OP = FUSED_OPS.get(key)
+        if self.FUSED_OP is None or key.quant not in QUANT_OPS:
+            self.FUSED_OP = None
+            self.quant_matcher = None
+            return
 
         self.quant_matcher = MatcherQuantFP8(
             key.quant,
@@ -177,6 +182,8 @@ class RMSNormStaticQuantPattern(RMSNormQuantPattern):
         super().__init__(epsilon, fused_key)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        if self.FUSED_OP is None:
+            return
         # Cannot use methods, as the self argument affects tracing
         def pattern(
             input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
@@ -232,6 +239,8 @@ class FusedAddRMSNormStaticQuantPattern(RMSNormQuantPattern):
         super().__init__(epsilon, key)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        if self.FUSED_OP is None:
+            return
         def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -315,6 +324,8 @@ class FusedAddRMSNormGroupQuantPattern(RMSNormQuantPattern):
         )
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        if self.FUSED_OP is None:
+            return
         def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -421,6 +432,8 @@ class RMSNormGroupQuantPattern(RMSNormQuantPattern):
         )
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        if self.FUSED_OP is None:
+            return
         def pattern(
             input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -503,6 +516,8 @@ class RMSNormDynamicQuantPattern(RMSNormQuantPattern):
         super().__init__(epsilon, key)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        if self.FUSED_OP is None:
+            return
         def pattern(
             input: torch.Tensor, weight: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -562,6 +577,8 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
         super().__init__(epsilon, key)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        if self.FUSED_OP is None:
+            return
         def pattern(
             input: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -353,10 +353,9 @@ class MatcherQuantFP8(MatcherCustomOp):
                 self.QUANT_OP = rocm_aiter_ops.get_group_quant_op()
 
         else:
-            assert quant_key in QUANT_OPS, (
-                f"unsupported quantization scheme {quant_key}"
-            )
-            self.QUANT_OP = QUANT_OPS[quant_key]
+            # May be missing on builds without the fused custom kernels
+            # (custom ops disabled); callers must skip such matchers.
+            self.QUANT_OP = QUANT_OPS.get(quant_key)
 
             assert quant_key.dtype == current_platform.fp8_dtype(), (
                 "Only QuantFP8 supported by"

@@ -307,6 +307,10 @@ class VllmFusionPatternMatcherPass(VllmPatternMatcherPass):
 
     @enable_fake_mode
     def register(self, pr: VllmPatternReplacement) -> None:
+        # Patterns whose fused custom ops are unavailable in this build mark
+        # themselves unsupported; skip them instead of failing at trace time.
+        if not getattr(pr, "supported", True):
+            return
         pm.register_replacement(
             pr.pattern,
             pr.replacement,
