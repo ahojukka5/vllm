@@ -6739,6 +6739,7 @@ class GPUModelRunner(
                                 if mode == CUDAGraphMode.FULL and i == 0
                                 else None
                             ),
+                            drain_pg_watchdog=current_platform.is_rocm(),
                         )
                         torch.accelerator.synchronize()
                         free_after = _free_vram()
@@ -6924,6 +6925,7 @@ class GPUModelRunner(
         allow_microbatching: bool = False,
         num_warmups: int | None = None,
         profiler: AbstractContextManager[Any] | None = None,
+        drain_pg_watchdog: bool = False,
     ):
         if profiler is None:
             profiler = nullcontext()
@@ -6946,6 +6948,18 @@ class GPUModelRunner(
             # Warmups may use auxiliary streams. Ensure all of their work has
             # completed before beginning CUDA graph capture.
             torch.accelerator.synchronize()
+        if drain_pg_watchdog:
+            # The memory-profiling path on ROCm captures on the *compute*
+            # stream (see profile_cudagraph_memory). Warmup dummy runs may
+            # issue torch ProcessGroup collectives (e.g. lazy NCCL comm init
+            # for a not-yet-used group), which record watchdog events on that
+            # same stream. If capture begins before the watchdog thread polls
+            # them, hipEventQuery returns hipErrorCapturedEvent ("operation
+            # not permitted on an event last recorded in a capturing stream")
+            # and the watchdog aborts the process. All work is complete after
+            # the synchronize above; sleeping a few watchdog poll intervals
+            # (100 ms each) lets it drain its work list before capture starts.
+            time.sleep(0.5)
         with (
             profiler,
             torch.profiler.record_function(
