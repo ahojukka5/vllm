@@ -255,17 +255,39 @@ def fused_moe_kernel_gptq_awq(
             # OCP MXFP4: e2m1 nibble values scaled by e8m0 (2**(scale-127))
             # per 32-element group. No zero point.
             b_scale_i = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-            factor = tl.exp2((b_scale_i.to(tl.int32) - 127).to(tl.float32))
-            sign = (b >> 3) & 1
-            exp = (b >> 1) & 0x3
-            mant = (b & 1).to(tl.float32)
-            mag = tl.where(
-                exp == 0,
-                0.5 * mant,
-                (1.0 + 0.5 * mant) * tl.exp2((exp - 1).to(tl.float32)),
-            )
-            fp4 = tl.where(sign == 1, -mag, mag)
-            b = (fp4 * factor).to(compute_type)
+            if compute_type == tl.bfloat16:
+                # Integer bit-compose directly into bf16: bf16 shares the
+                # 8-bit exponent with e8m0, so the group scale folds into
+                # the exponent field as an integer add. e2m1 normal
+                # (exp>0): value = (1+m/2)*2^(exp-1) -> biased_exp =
+                # exp + scale - 1, top mantissa bit = m. Subnormal
+                # (exp==0, m==1): value = 0.5 -> biased_exp = scale - 1,
+                # mantissa 0 (same exp formula with exp==0, mant dropped).
+                # Avoids exp2 transcendentals and float selects entirely.
+                scale_i = b_scale_i.to(tl.int32)
+                sign = (b >> 3).to(tl.int32) & 1
+                exp = (b >> 1).to(tl.int32) & 0x3
+                mant = (b & 1).to(tl.int32)
+                exp_bits = exp + scale_i - 1
+                mant_bit = tl.where(exp > 0, mant, 0)
+                bits = (sign << 15) | (exp_bits << 7) | (mant_bit << 6)
+                # +-0 nibbles, or exponent underflow (denormal), flush to 0.
+                bits = tl.where(
+                    ((b & 0x7) == 0) | (exp_bits <= 0), 0, bits
+                )
+                b = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+            else:
+                factor = tl.exp2((b_scale_i.to(tl.int32) - 127).to(tl.float32))
+                sign = (b >> 3) & 1
+                exp = (b >> 1) & 0x3
+                mant = (b & 1).to(tl.float32)
+                mag = tl.where(
+                    exp == 0,
+                    0.5 * mant,
+                    (1.0 + 0.5 * mant) * tl.exp2((exp - 1).to(tl.float32)),
+                )
+                fp4 = tl.where(sign == 1, -mag, mag)
+                b = (fp4 * factor).to(compute_type)
         else:
             b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
             b_scale = b_scale.to(tl.float32)
