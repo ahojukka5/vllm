@@ -31,6 +31,7 @@ from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 from .matcher_utils import (
     MatcherQuantFP8,
+    opt_c_op,
 )
 
 logger = init_logger(__name__)
@@ -84,13 +85,17 @@ def empty_i64(*args: Any, **kwargs: Any) -> torch.Tensor:
     )
 
 
-RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
+RMS_ADD_OP = opt_c_op("fused_add_rms_norm")
 
-QUANT_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTensorSym: torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTokenSym: torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
-}
+QUANT_OPS: dict[QuantKey, OpOverload] = {}
+for _key, _name in (
+    (kFp8StaticTensorSym, "static_scaled_fp8_quant"),
+    (kFp8DynamicTensorSym, "dynamic_scaled_fp8_quant"),
+    (kFp8DynamicTokenSym, "dynamic_per_token_scaled_fp8_quant"),
+):
+    _op = opt_c_op(_name)
+    if _op is not None:
+        QUANT_OPS[_key] = _op
 if hasattr(torch.ops._C, "per_token_group_fp8_quant"):
     QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
     QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
@@ -115,20 +120,16 @@ class FusedRMSQuantKey(NamedTuple):
         )
 
 
-FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {
-    FusedRMSQuantKey(
-        kFp8StaticTensorSym, False
-    ): torch.ops._C.rms_norm_static_fp8_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8StaticTensorSym, True
-    ): torch.ops._C.fused_add_rms_norm_static_fp8_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8DynamicTokenSym, False
-    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8DynamicTokenSym, True
-    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
-}
+FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {}
+for _key, _name in (
+    (FusedRMSQuantKey(kFp8StaticTensorSym, False), "rms_norm_static_fp8_quant"),
+    (FusedRMSQuantKey(kFp8StaticTensorSym, True), "fused_add_rms_norm_static_fp8_quant"),  # noqa: E501
+    (FusedRMSQuantKey(kFp8DynamicTokenSym, False), "rms_norm_dynamic_per_token_quant"),  # noqa: E501
+    (FusedRMSQuantKey(kFp8DynamicTokenSym, True), "rms_norm_dynamic_per_token_quant"),  # noqa: E501
+):
+    _op = opt_c_op(_name)
+    if _op is not None:
+        FUSED_OPS[_key] = _op
 # rms_norm_per_block_quant is CUDA-only; guard it like per_token_group_fp8_quant above.
 if hasattr(torch.ops._C, "rms_norm_per_block_quant"):
     _rms_norm_per_block_quant = torch.ops._C.rms_norm_per_block_quant.default
