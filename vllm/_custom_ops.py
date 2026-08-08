@@ -3101,17 +3101,49 @@ def gather_and_maybe_dequant_cache(
     scale: torch.Tensor,
     seq_starts: torch.Tensor | None = None,
 ) -> None:
-    torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(
-        src_cache,
-        dst,
-        block_table,
-        cu_seq_lens,
-        token_to_seq,
-        num_tokens,
-        kv_cache_dtype,
-        scale,
-        seq_starts,
-    )
+    if hasattr(torch.ops._C_cache_ops, "gather_and_maybe_dequant_cache"):
+        torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(
+            src_cache,
+            dst,
+            block_table,
+            cu_seq_lens,
+            token_to_seq,
+            num_tokens,
+            kv_cache_dtype,
+            scale,
+            seq_starts,
+        )
+        return
+
+    # Torch-native fallback for builds whose _C_cache_ops lacks the kernel
+    # (e.g. the gfx90a ROCm build). Mirrors the CUDA kernel's gather layout.
+    if kv_cache_dtype != "auto":
+        raise RuntimeError(
+            "The PyTorch-native gather_and_maybe_dequant_cache fallback "
+            f"only supports kv_cache_dtype='auto', got {kv_cache_dtype!r}"
+        )
+    num_tokens = int(num_tokens)
+    if num_tokens <= 0:
+        return
+    device = src_cache.device
+    block_size = src_cache.shape[1]
+    token_ids = torch.arange(num_tokens, device=device, dtype=torch.int64)
+    seq_ids = token_to_seq[:num_tokens].to(torch.int64)
+    cu = cu_seq_lens.to(torch.int64)
+    batch_offset = token_ids - cu[seq_ids]
+    valid = token_ids < cu[seq_ids + 1]
+    if seq_starts is not None:
+        batch_offset = batch_offset + seq_starts.to(torch.int64)[seq_ids]
+    block_table_id = batch_offset // block_size
+    valid &= block_table_id < block_table.shape[1]
+    if not bool(valid.all()):
+        token_ids = token_ids[valid]
+        seq_ids = seq_ids[valid]
+        batch_offset = batch_offset[valid]
+        block_table_id = block_table_id[valid]
+    block_ids = block_table.to(torch.int64)[seq_ids, block_table_id]
+    slot_ids = batch_offset % block_size
+    dst[token_ids] = src_cache[block_ids, slot_ids].to(dst.dtype)
 
 
 def cp_gather_cache(
