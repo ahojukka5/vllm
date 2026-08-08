@@ -60,15 +60,11 @@ class ActivationQuantPattern(VllmPatternReplacement):
         self.quant_key = quant_key
         self.quant_dtype = quant_key.dtype
 
-        assert self.quant_key in QUANT_OPS, (
-            f"unsupported quantization scheme {self.quant_key}"
-        )
-        self.QUANT_OP = QUANT_OPS[self.quant_key]
-
-        assert self.quant_key in FUSED_OPS, (
-            f"unsupported fusion scheme {self.quant_key}"
-        )
-        self.FUSED_OP = FUSED_OPS[self.quant_key]
+        # Ops may be missing on builds without the fused custom kernels
+        # (e.g. custom ops disabled): callers skip registration then.
+        self.QUANT_OP = QUANT_OPS.get(self.quant_key)
+        self.FUSED_OP = FUSED_OPS.get(self.quant_key)
+        self.supported = self.QUANT_OP is not None and self.FUSED_OP is not None
 
         self.silu_and_mul_matcher = MatcherSiluAndMul()
 
