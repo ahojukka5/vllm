@@ -18,12 +18,12 @@ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
-from .matcher_utils import MatcherRotaryEmbedding
+from .matcher_utils import MatcherRotaryEmbedding, opt_c_op
 from .rms_quant_fusion import empty_bf16, empty_fp32, empty_i64
 
 logger = init_logger(__name__)
 
-FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default
+FUSED_QK_ROPE_OP = opt_c_op("fused_qk_norm_rope")
 
 # Head dimensions supported by csrc/fused_qknorm_rope_kernel.cu's
 # launchFusedQKNormRope and launchFusedQKNormRopeNTokenHeads dispatchers.

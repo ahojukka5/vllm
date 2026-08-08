@@ -20,7 +20,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 
 from ..vllm_inductor_pass import VllmFusionPatternMatcherPass, VllmPatternReplacement
-from .matcher_utils import MatcherQuantFP8, MatcherSiluAndMul
+from .matcher_utils import MatcherQuantFP8, MatcherSiluAndMul, opt_c_op
 from .rms_quant_fusion import QUANT_OPS, empty_bf16, empty_fp32, empty_i32
 
 logger = init_logger(__name__)
@@ -28,11 +28,12 @@ logger = init_logger(__name__)
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
-SILU_MUL_OP = torch.ops._C.silu_and_mul.default
+SILU_MUL_OP = opt_c_op("silu_and_mul")
 
-FUSED_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.silu_and_mul_quant.default,  # noqa: E501
-}
+FUSED_OPS: dict[QuantKey, OpOverload] = {}
+_silu_mul_quant = opt_c_op("silu_and_mul_quant")
+if _silu_mul_quant is not None:
+    FUSED_OPS[kFp8StaticTensorSym] = _silu_mul_quant
 silu_and_mul_nvfp4_quant_supported = current_platform.is_cuda() and hasattr(
     torch.ops._C, "silu_and_mul_nvfp4_quant"
 )
@@ -40,8 +41,10 @@ if silu_and_mul_nvfp4_quant_supported:
     FUSED_OPS[kNvfp4Dynamic] = torch.ops._C.silu_and_mul_nvfp4_quant.default  # noqa: E501
 
 if current_platform.is_cuda_alike():
-    FUSED_OPS[kFp8Dynamic128Sym] = torch.ops._C.silu_and_mul_per_block_quant.default
-    FUSED_OPS[kFp8Dynamic64Sym] = torch.ops._C.silu_and_mul_per_block_quant.default
+    _silu_mul_per_block_quant = opt_c_op("silu_and_mul_per_block_quant")
+    if _silu_mul_per_block_quant is not None:
+        FUSED_OPS[kFp8Dynamic128Sym] = _silu_mul_per_block_quant
+        FUSED_OPS[kFp8Dynamic64Sym] = _silu_mul_per_block_quant
 
 
 class ActivationQuantPattern(VllmPatternReplacement):

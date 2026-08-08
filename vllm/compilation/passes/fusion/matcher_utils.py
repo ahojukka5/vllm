@@ -29,14 +29,29 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
 )
 from vllm.platforms import current_platform
 
-ROTARY_OP = torch.ops._C.rotary_embedding.default
-FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
+def opt_c_op(name: str, overload: str = "default"):
+    """Look up torch.ops._C.<name>.<overload>, or None if the custom op is
+    not registered (e.g. builds with custom ops disabled)."""
+    op = getattr(torch.ops._C, name, None)
+    return getattr(op, overload) if op is not None else None
 
-QUANT_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTensorSym: torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTokenSym: torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
-}
+
+ROTARY_OP = opt_c_op("rotary_embedding")
+FLASHINFER_ROTARY_OP = (
+    torch.ops.vllm.flashinfer_rotary_embedding.default
+    if hasattr(torch.ops.vllm, "flashinfer_rotary_embedding")
+    else None
+)
+
+QUANT_OPS: dict[QuantKey, OpOverload] = {}
+if hasattr(torch.ops._C, "static_scaled_fp8_quant"):
+    QUANT_OPS[kFp8StaticTensorSym] = torch.ops._C.static_scaled_fp8_quant.default  # noqa: E501
+if hasattr(torch.ops._C, "dynamic_scaled_fp8_quant"):
+    QUANT_OPS[kFp8DynamicTensorSym] = torch.ops._C.dynamic_scaled_fp8_quant.default  # noqa: E501
+if hasattr(torch.ops._C, "dynamic_per_token_scaled_fp8_quant"):
+    QUANT_OPS[kFp8DynamicTokenSym] = (
+        torch.ops._C.dynamic_per_token_scaled_fp8_quant.default
+    )
 
 if hasattr(torch.ops._C, "per_token_group_fp8_quant"):
     QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
@@ -46,7 +61,7 @@ if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out  # noqa: E501
 
 
-SILU_MUL_OP = torch.ops._C.silu_and_mul.default
+SILU_MUL_OP = opt_c_op("silu_and_mul")
 
 
 class MatcherCustomOp(ABC):
