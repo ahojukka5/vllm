@@ -119,6 +119,25 @@ def grouped_topk(
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
 
+    if (num_expert_group == 1 and topk_group == 1 and _GROUPED_TOPK_FAST
+            and scoring_func == "sigmoid" and current_platform.is_rocm()
+            and e_score_correction_bias is not None
+            and not envs.VLLM_BATCH_INVARIANT):
+        # Fully fused Triton router: sigmoid+bias+topk+renorm in ONE kernel.
+        # ROCm's torch.topk lowers to gatherTopK + radixSortKVInPlace
+        # (~72 us/layer at E=896, ~7 ms/step at 92 layers); the fused kernel
+        # is ~8 us. Bit-matched against the torch reference below.
+        from vllm.model_executor.layers.fused_moe.router.sig_topk_fused import (
+            sig_topk_fused_impl,
+        )
+        return sig_topk_fused_impl(
+            gating_output,
+            e_score_correction_bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+        )
+
     if num_expert_group == 1 and topk_group == 1 and _GROUPED_TOPK_FAST:
         # Single-group degenerate case (K3: num_expert_group=1, topk_group=1):
         # the group scoring/masking machinery below is a no-op (the one group
